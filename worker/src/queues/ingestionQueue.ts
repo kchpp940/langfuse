@@ -291,16 +291,59 @@ export const ingestionQueueProcessorBuilder = (
         forwardToEventsTable,
       );
 
-      if (!mergeResult.success) {
-        // Merge failed - do not set "seen" cache so the job can be retried.
-        // Throw to trigger BullMQ retry mechanism.
-        throw mergeResult.error ?? new Error("Unknown mergeAndWrite failure");
+      // Determine whether we should retry the job based on critical vs secondary failures.
+      // Retry only when critical operations failed (main table write, session upsert, dataset item lookup).
+      // Secondary failures (staging table write, eval queue, wrapper trace, score validation)
+      // are logged but do not trigger a retry since the core data was persisted safely.
+      const criticalOpsFailed =
+        mergeResult.critical.mainTableWrite.status === "failed" ||
+        mergeResult.critical.sessionUpsert.status === "failed" ||
+        mergeResult.critical.datasetItemLookup.status === "failed";
+
+      // Check if any secondary operations failed (for logging / observability).
+      const secondaryOpsFailed =
+        mergeResult.secondary.stagingTableWrite.status === "failed" ||
+        mergeResult.secondary.traceUpsertQueue.status === "failed" ||
+        mergeResult.secondary.wrapperTraceWrite.status === "failed" ||
+        mergeResult.secondary.scoreValidation.status === "failed";
+
+      if (criticalOpsFailed) {
+        // Critical data loss scenario: core record was not written.
+        // Do NOT set "seen" cache; throw so BullMQ retries the job.
+        const firstCriticalError =
+          mergeResult.critical.mainTableWrite.error ??
+          mergeResult.critical.sessionUpsert.error ??
+          mergeResult.critical.datasetItemLookup.error ??
+          mergeResult.error ??
+          new Error("Unknown critical mergeAndWrite failure");
+        logger.error(
+          `Critical mergeAndWrite failure for project ${job.data.payload.authCheck.scope.projectId} eventBody ${job.data.payload.data.eventBodyId} - will retry`,
+          {
+            eventType: job.data.payload.data.type,
+            critical: mergeResult.critical,
+            secondary: secondaryOpsFailed ? mergeResult.secondary : undefined,
+            error: firstCriticalError,
+          },
+        );
+        throw firstCriticalError;
       }
 
-      // Set "seen" keys in Redis only after successful merge to avoid reprocessing for fast updates.
+      // Core data is safely persisted. Mark S3 files as seen even if secondary ops had issues.
+      // Secondary ops are best-effort and do not justify reprocessing the entire eventBody.
+      if (secondaryOpsFailed) {
+        logger.warn(
+          `mergeAndWrite succeeded with secondary failures for project ${job.data.payload.authCheck.scope.projectId} eventBody ${job.data.payload.data.eventBodyId} - marking as seen anyway`,
+          {
+            eventType: job.data.payload.data.type,
+            secondary: mergeResult.secondary,
+          },
+        );
+      }
+
+      // Set "seen" keys in Redis only after successful critical-path merge to avoid reprocessing for fast updates.
       // We use Promise.all internally instead of a redis.pipeline since autoPipelining should handle it correctly
       // while being redis cluster aware.
-      // IMPORTANT: This must happen AFTER successful merge so that failed events can be retried.
+      // IMPORTANT: This must happen AFTER successful critical merge so that failed events can be retried.
       if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
         try {
           await Promise.all(
@@ -317,7 +360,7 @@ export const ingestionQueueProcessorBuilder = (
           );
         } catch (e) {
           logger.warn(
-            `Failed to set recently-processed cache after successful merge. Events may be reprocessed.`,
+            `Failed to set recently-processed cache after successful merge. Events may be reprocessed (idempotent, so safe).`,
             e,
           );
         }
