@@ -140,11 +140,23 @@ export interface MergeOperationResult {
   error?: Error;
 }
 
+export interface S3ProcessedFile {
+  s3FileKey: string;      // S3 file path (e.g. "evt1.json")
+  eventIds: string[];     // event ids contained in this file
+  processed: boolean;     // whether this file's events were passed to mergeAndWrite
+}
+
 export interface MergeAndWriteResult {
   // Overall success: true if all critical operations succeeded.
   // If critical ops succeeded but some secondary ops failed, this is still true.
   success: boolean;
+  eventBodyId: string;
+  eventType: IngestionEntityTypes;
   eventCount: number;
+  // Raw events that were attempted to be merged. Retained for re-enqueue on failure.
+  rawEvents: IngestionEventType[];
+  // S3 files that were downloaded and parsed successfully (eligible for "seen" cache)
+  s3Files: S3ProcessedFile[];
   critical: {
     // Core ClickHouse table write (Traces/Observations/Scores/DatasetRunItems)
     mainTableWrite: MergeOperationResult;
@@ -199,6 +211,7 @@ export class IngestionService {
     createdAtTimestamp: Date,
     events: IngestionEventType[],
     forwardToEventsTable: boolean,
+    s3Files: S3ProcessedFile[] = [],
   ): Promise<MergeAndWriteResult> {
     logger.debug(
       `Merging ingestion ${eventType} event for project ${projectId} and event ${eventBodyId}`,
@@ -206,7 +219,11 @@ export class IngestionService {
 
     let result: MergeAndWriteResult = {
       success: false,
+      eventBodyId,
+      eventType,
       eventCount: events.length,
+      rawEvents: events,
+      s3Files,
       critical: { ...EMPTY_CRITICAL },
       secondary: { ...EMPTY_SECONDARY },
     };
