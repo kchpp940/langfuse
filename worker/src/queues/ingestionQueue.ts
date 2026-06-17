@@ -267,9 +267,40 @@ export const ingestionQueueProcessorBuilder = (
         return;
       }
 
-      // Set "seen" keys in Redis to avoid reprocessing for fast updates.
+      // Perform merge of those events
+      if (!redis) throw new Error("Redis not available");
+      if (!prisma) throw new Error("Prisma not available");
+
+      // Determine whether to forward to staging events table
+      // Use explicit flag from job payload if provided, otherwise fall back to env flags
+      const forwardToEventsTable =
+        job.data.payload.data.forwardToEventsTable ??
+        v4WritesToEventsTable(env);
+
+      const mergeResult = await new IngestionService(
+        redis,
+        prisma,
+        clickhouseWriter,
+        clickhouseClient(),
+      ).mergeAndWrite(
+        getClickhouseEntityType(events[0].type),
+        job.data.payload.authCheck.scope.projectId,
+        job.data.payload.data.eventBodyId,
+        firstS3WriteTime,
+        events,
+        forwardToEventsTable,
+      );
+
+      if (!mergeResult.success) {
+        // Merge failed - do not set "seen" cache so the job can be retried.
+        // Throw to trigger BullMQ retry mechanism.
+        throw mergeResult.error ?? new Error("Unknown mergeAndWrite failure");
+      }
+
+      // Set "seen" keys in Redis only after successful merge to avoid reprocessing for fast updates.
       // We use Promise.all internally instead of a redis.pipeline since autoPipelining should handle it correctly
       // while being redis cluster aware.
+      // IMPORTANT: This must happen AFTER successful merge so that failed events can be retried.
       if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
         try {
           await Promise.all(
@@ -286,35 +317,11 @@ export const ingestionQueueProcessorBuilder = (
           );
         } catch (e) {
           logger.warn(
-            `Failed to set recently-processed cache. Continuing processing.`,
+            `Failed to set recently-processed cache after successful merge. Events may be reprocessed.`,
             e,
           );
         }
       }
-
-      // Perform merge of those events
-      if (!redis) throw new Error("Redis not available");
-      if (!prisma) throw new Error("Prisma not available");
-
-      // Determine whether to forward to staging events table
-      // Use explicit flag from job payload if provided, otherwise fall back to env flags
-      const forwardToEventsTable =
-        job.data.payload.data.forwardToEventsTable ??
-        v4WritesToEventsTable(env);
-
-      await new IngestionService(
-        redis,
-        prisma,
-        clickhouseWriter,
-        clickhouseClient(),
-      ).mergeAndWrite(
-        getClickhouseEntityType(events[0].type),
-        job.data.payload.authCheck.scope.projectId,
-        job.data.payload.data.eventBodyId,
-        firstS3WriteTime,
-        events,
-        forwardToEventsTable,
-      );
     } catch (e) {
       // Check if this is a SlowDown error and mark the project for secondary queue
       if (isS3SlowDownError(e)) {

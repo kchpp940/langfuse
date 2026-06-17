@@ -133,6 +133,12 @@ const immutableEntityKeys: {
   ],
 };
 
+export interface MergeAndWriteResult {
+  success: boolean;
+  eventCount: number;
+  error?: Error;
+}
+
 export class IngestionService {
   private promptService: PromptService;
 
@@ -152,44 +158,66 @@ export class IngestionService {
     createdAtTimestamp: Date,
     events: IngestionEventType[],
     forwardToEventsTable: boolean,
-  ): Promise<void> {
+  ): Promise<MergeAndWriteResult> {
     logger.debug(
       `Merging ingestion ${eventType} event for project ${projectId} and event ${eventBodyId}`,
     );
 
-    switch (eventType) {
-      case "trace":
-        return await this.processTraceEventList({
-          projectId,
-          entityId: eventBodyId,
-          createdAtTimestamp,
-          traceEventList: events as TraceEventType[],
-          createEventTraceRecord: forwardToEventsTable,
-        });
-      case "observation":
-        return await this.processObservationEventList({
-          projectId,
-          entityId: eventBodyId,
-          createdAtTimestamp,
-          observationEventList: events as ObservationEvent[],
-          writeToStagingTables: forwardToEventsTable,
-        });
-      case "score": {
-        return await this.processScoreEventList({
-          projectId,
-          entityId: eventBodyId,
-          createdAtTimestamp,
-          scoreEventList: events as ScoreEventType[],
-        });
+    try {
+      switch (eventType) {
+        case "trace":
+          await this.processTraceEventList({
+            projectId,
+            entityId: eventBodyId,
+            createdAtTimestamp,
+            traceEventList: events as TraceEventType[],
+            createEventTraceRecord: forwardToEventsTable,
+          });
+          break;
+        case "observation":
+          await this.processObservationEventList({
+            projectId,
+            entityId: eventBodyId,
+            createdAtTimestamp,
+            observationEventList: events as ObservationEvent[],
+            writeToStagingTables: forwardToEventsTable,
+          });
+          break;
+        case "score": {
+          await this.processScoreEventList({
+            projectId,
+            entityId: eventBodyId,
+            createdAtTimestamp,
+            scoreEventList: events as ScoreEventType[],
+          });
+          break;
+        }
+        case "dataset_run_item": {
+          await this.processDatasetRunItemEventList({
+            projectId,
+            entityId: eventBodyId,
+            createdAtTimestamp,
+            datasetRunItemEventList: events as DatasetRunItemEventType[],
+          });
+          break;
+        }
       }
-      case "dataset_run_item": {
-        return await this.processDatasetRunItemEventList({
-          projectId,
-          entityId: eventBodyId,
-          createdAtTimestamp,
-          datasetRunItemEventList: events as DatasetRunItemEventType[],
-        });
-      }
+
+      return {
+        success: true,
+        eventCount: events.length,
+      };
+    } catch (error) {
+      logger.error(
+        `Failed to merge and write ${eventType} event for project ${projectId} and event ${eventBodyId}`,
+        error,
+      );
+      traceException(error);
+      return {
+        success: false,
+        eventCount: events.length,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
     }
   }
 
