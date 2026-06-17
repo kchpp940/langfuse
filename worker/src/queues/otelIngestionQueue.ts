@@ -432,22 +432,33 @@ export const otelIngestionQueueProcessorBuilder = (
         // the highest possible throughput. Therefore, we start with a Promise.all.
         // If necessary, we may use a for each instead.
 
-        // Process observations via mergeAndWrite
-        const observationWritePromise = Promise.all(
-          observations.map((observation) =>
-            ingestionService.mergeAndWrite(
-              getClickhouseEntityType(observation.type),
-              auth.scope.projectId,
-              observation.body.id || "", // id is always defined for observations
-              new Date(), // Use the current timestamp as event time
-              [observation],
-              shouldForwardToEventsTable,
-            ),
-          ),
+        // Process observations via mergeAndWrite.
+        // Use allSettled so a single failing observation does not abort the entire batch.
+        const observationWritePromise = Promise.allSettled(
+          observations.map(async (observation) => {
+            try {
+              await ingestionService.mergeAndWrite(
+                getClickhouseEntityType(observation.type),
+                auth.scope.projectId,
+                observation.body.id || "", // id is always defined for observations
+                new Date(), // Use the current timestamp as event time
+                [observation],
+                shouldForwardToEventsTable,
+              );
+            } catch (error) {
+              logger.error(
+                `Failed to merge and write otel observation for project ${auth.scope.projectId} and observation ${observation.body.id || observation.id}`,
+                { error, fileKey },
+              );
+              traceException(error);
+              throw error;
+            }
+          }),
         );
 
-        // Process traces and observations concurrently
-        await Promise.all([
+        // Process traces and observations concurrently.
+        // Use allSettled so a failure in one branch does not cancel the other.
+        const [observationResults, traceResults] = await Promise.allSettled([
           observationWritePromise,
           processEventBatch(traces, auth, {
             delay: 0,
@@ -455,6 +466,21 @@ export const otelIngestionQueueProcessorBuilder = (
             forwardToEventsTable: shouldForwardToEventsTable,
           }),
         ]);
+
+        // Log observation-level failures without rethrowing (already logged per-observation above)
+        if (observationResults.status === "rejected") {
+          logger.error(
+            `One or more otel observations failed to process for project ${auth.scope.projectId}`,
+            { error: observationResults.reason, fileKey },
+          );
+        }
+        if (traceResults.status === "rejected") {
+          logger.error(
+            `Failed to process otel traces for project ${auth.scope.projectId}`,
+            { error: traceResults.reason, fileKey },
+          );
+          traceException(traceResults.reason);
+        }
       }
 
       // Process events for observation evals and direct event writes

@@ -167,42 +167,74 @@ export const ingestionQueueProcessorBuilder = (
         const filePath = `${s3Prefix}${job.data.payload.data.fileKey}.json`;
         eventFiles = [{ file: filePath, createdAt: new Date() }];
 
-        const file = await s3Client.download(filePath);
-        const fileSize = file.length;
+        try {
+          const file = await s3Client.download(filePath);
+          const fileSize = file.length;
 
-        recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
-          skippedS3List: "true",
-        });
-        totalS3DownloadSizeBytes += fileSize;
+          recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
+            skippedS3List: "true",
+          });
+          totalS3DownloadSizeBytes += fileSize;
 
-        const parsedFile = JSON.parse(file);
-        events.push(...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]));
+          const parsedFile = JSON.parse(file);
+          events.push(...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]));
+        } catch (e) {
+          logger.error(
+            `Failed to download or parse S3 file ${filePath} for project ${job.data.payload.authCheck.scope.projectId} and event ${job.data.payload.data.eventBodyId}`,
+            e,
+          );
+          // Remove the failed file from eventFiles so it is not cached as "seen" below
+          eventFiles = eventFiles.filter((f) => f.file !== filePath);
+        }
       } else {
         eventFiles = await s3Client.listFiles(s3Prefix);
 
         // Process files in batches
         // If a user has 5k events, this will likely take 100 seconds.
         const downloadAndParseFile = async (fileRef: { file: string }) => {
-          const file = await s3Client.download(fileRef.file);
-          const fileSize = file.length;
+          try {
+            const file = await s3Client.download(fileRef.file);
+            const fileSize = file.length;
 
-          recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
-            skippedS3List: "false",
-          });
-          totalS3DownloadSizeBytes += fileSize;
+            recordHistogram("langfuse.ingestion.s3_file_size_bytes", fileSize, {
+              skippedS3List: "false",
+            });
+            totalS3DownloadSizeBytes += fileSize;
 
-          const parsedFile = JSON.parse(file);
-          return Array.isArray(parsedFile) ? parsedFile : [parsedFile];
+            const parsedFile = JSON.parse(file);
+            return {
+              file: fileRef.file,
+              events: Array.isArray(parsedFile) ? parsedFile : [parsedFile],
+              success: true as const,
+            };
+          } catch (e) {
+            logger.error(
+              `Failed to download or parse S3 file ${fileRef.file} for project ${job.data.payload.authCheck.scope.projectId} and event ${job.data.payload.data.eventBodyId}`,
+              e,
+            );
+            return { file: fileRef.file, events: [], success: false as const };
+          }
         };
 
         const S3_CONCURRENT_READS = env.LANGFUSE_S3_CONCURRENT_READS;
         const batches = chunk(eventFiles, S3_CONCURRENT_READS);
+        const successfullyProcessedFiles: string[] = [];
         for (const batch of batches) {
-          const batchEvents = await Promise.all(
+          const batchResults = await Promise.all(
             batch.map(downloadAndParseFile),
           );
-          events.push(...batchEvents.flat());
+          for (const result of batchResults) {
+            events.push(...result.events);
+            if (result.success) {
+              successfullyProcessedFiles.push(result.file);
+            }
+          }
         }
+        // Only keep files in eventFiles that were successfully processed,
+        // so failed files are not cached as "seen" below and may be retried.
+        eventFiles = eventFiles.filter((f) =>
+          successfullyProcessedFiles.includes(f.file),
+        );
       }
 
       recordDistribution(

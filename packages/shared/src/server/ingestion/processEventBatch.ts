@@ -188,6 +188,8 @@ export const processEventBatch = async (
 
   // We group events by eventBodyId which allows us to store and process them
   // as one which reduces infra interactions per event. Only used in the S3 case.
+  // For events without body.id (e.g. trace/score where id is optional), fall back
+  // to the event's own id so every event always has a processing group.
   const sortedBatchByEventBodyId = sortedBatch.reduce(
     (
       acc: Record<
@@ -201,16 +203,14 @@ export const processEventBatch = async (
       >,
       event,
     ) => {
-      if (!event.body?.id) {
-        return acc;
-      }
-      const key = `${getClickhouseEntityType(event.type)}-${event.body.id}`;
+      const eventBodyId = event.body?.id ?? event.id;
+      const key = `${getClickhouseEntityType(event.type)}-${eventBodyId}`;
       if (!acc[key]) {
         acc[key] = {
           data: [],
           key: event.id,
           type: event.type,
-          eventBodyId: event.body.id,
+          eventBodyId,
         };
       }
       acc[key].data.push(event);
@@ -222,26 +222,39 @@ export const processEventBatch = async (
   /********************
    * ASYNC PROCESSING *
    ********************/
-  let s3UploadErrored = false;
+  // Track per-eventBodyId failures so a single bad group does not take down the whole batch.
+  const failedEventBodyIds: Set<string> = new Set();
+  const processingErrors: { id: string; error: unknown }[] = [];
+
   await instrumentAsync({ name: "s3-upload-events" }, async () => {
-    // S3 Event Upload is blocking, but non-failing.
-    // If a promise rejects, we log it below, but do not throw an error.
-    // In this case, we upload the full batch into the Redis queue.
+    // S3 Event Upload is blocking, but non-failing per eventBodyId.
+    // If a promise rejects, we record the failed eventBodyId and skip enqueuing it,
+    // but continue processing all other groups.
+    const s3Keys = Object.keys(sortedBatchByEventBodyId);
     const results = await Promise.allSettled(
-      Object.keys(sortedBatchByEventBodyId).map(async (id) => {
-        // We upload the event in an array to the S3 bucket grouped by the eventBodyId.
-        // That way we batch updates from the same invocation into a single file and reduce
-        // write operations on S3.
+      s3Keys.map(async (id) => {
         const { data, key, type, eventBodyId } = sortedBatchByEventBodyId[id];
         const bucketPath = `${env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}${authCheck.scope.projectId}/${getClickhouseEntityType(type)}/${eventBodyId}/${key}.json`;
-        return getS3StorageServiceClient(
-          env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
-        ).uploadJson(bucketPath, data);
+        return {
+          eventBodyId,
+          eventIds: data.map((e) => e.id),
+          upload: getS3StorageServiceClient(
+            env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
+          ).uploadJson(bucketPath, data),
+        };
       }),
     );
-    results.forEach((result) => {
+    results.forEach((result, index) => {
+      const eventBodyId = s3Keys[index];
+      const group = sortedBatchByEventBodyId[eventBodyId];
       if (result.status === "rejected") {
-        s3UploadErrored = true;
+        failedEventBodyIds.add(eventBodyId);
+        group.data.forEach((e) => {
+          processingErrors.push({
+            id: e.id,
+            error: new Error("Failed to upload event to blob storage"),
+          });
+        });
 
         // Check if this is a SlowDown error and mark the project for secondary queue
         if (isS3SlowDownError(result.reason)) {
@@ -258,17 +271,12 @@ export const processEventBatch = async (
 
         logger.error("Failed to upload event to S3", {
           error: result.reason,
+          projectId: authCheck.scope.projectId,
+          eventBodyId,
         });
       }
     });
   });
-
-  // Send each event individually to IngestionQueue for ClickHouse processing
-  if (s3UploadErrored) {
-    throw new Error(
-      "Failed to upload events to blob storage, aborting event processing",
-    );
-  }
 
   if (!redis) {
     throw new Error("Redis not initialized, aborting event processing");
@@ -277,79 +285,113 @@ export const processEventBatch = async (
   const projectIdsToSkipS3List =
     env.LANGFUSE_SKIP_S3_LIST_FOR_OBSERVATIONS_PROJECT_IDS?.split(",") ?? [];
 
-  await Promise.all(
-    Object.keys(sortedBatchByEventBodyId).map(async (id) => {
-      const eventData = sortedBatchByEventBodyId[id];
-      const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
-      const queue = IngestionQueue.getInstance({ shardingKey });
+  // Use allSettled so one enqueue failure does not abort the rest of the batch.
+  const enqueueResults = await Promise.allSettled(
+    Object.keys(sortedBatchByEventBodyId)
+      .filter((id) => !failedEventBodyIds.has(id))
+      .map(async (id) => {
+        const eventData = sortedBatchByEventBodyId[id];
+        const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
+        const queue = IngestionQueue.getInstance({ shardingKey });
 
-      const isDatasetRunItemEvent =
-        getClickhouseEntityType(eventData.type) === "dataset_run_item";
-      const isObservationEvent =
-        getClickhouseEntityType(eventData.type) === "observation";
+        const isDatasetRunItemEvent =
+          getClickhouseEntityType(eventData.type) === "dataset_run_item";
+        const isObservationEvent =
+          getClickhouseEntityType(eventData.type) === "observation";
 
-      const isOtelOrSkipS3Project =
-        authCheck.scope.projectId !== null &&
-        (source === "otel" ||
-          projectIdsToSkipS3List.includes(authCheck.scope.projectId));
+        const isOtelOrSkipS3Project =
+          authCheck.scope.projectId !== null &&
+          (source === "otel" ||
+            projectIdsToSkipS3List.includes(authCheck.scope.projectId));
 
-      const shouldSkipS3List =
-        isDatasetRunItemEvent || (isObservationEvent && isOtelOrSkipS3Project);
+        const shouldSkipS3List =
+          isDatasetRunItemEvent || (isObservationEvent && isOtelOrSkipS3Project);
 
-      const { isSampled, isSamplingConfigured } = isTraceIdInSample({
-        projectId: authCheck.scope.projectId,
-        event: eventData.data[0],
-      });
-
-      if (!isSampled) {
-        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
-          projectId: authCheck.scope.projectId ?? "<not set>",
-          sampling_decision: "out",
+        const { isSampled, isSamplingConfigured } = isTraceIdInSample({
+          projectId: authCheck.scope.projectId,
+          event: eventData.data[0],
         });
 
-        return;
-      }
+        if (!isSampled) {
+          recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+            projectId: authCheck.scope.projectId ?? "<not set>",
+            sampling_decision: "out",
+          });
 
-      if (isSamplingConfigured) {
-        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
-          projectId: authCheck.scope.projectId ?? "<not set>",
-          sampling_decision: "in",
-        });
-      }
+          return { eventBodyId: id, sampledOut: true, eventIds: eventData.data.map((e) => e.id) };
+        }
 
-      return queue
-        ? queue.add(
-            QueueJobs.IngestionJob,
-            {
-              id: randomUUID(),
-              timestamp: new Date(),
-              name: QueueJobs.IngestionJob as const,
-              payload: {
-                data: {
-                  type: eventData.type,
-                  eventBodyId: eventData.eventBodyId,
-                  fileKey: eventData.key,
-                  skipS3List: shouldSkipS3List,
-                  forwardToEventsTable,
-                },
-                authCheck: authCheck as {
-                  validKey: true;
-                  scope: {
-                    projectId: string;
-                    accessLevel: "project" | "scores";
-                  };
-                },
+        if (isSamplingConfigured) {
+          recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+            projectId: authCheck.scope.projectId ?? "<not set>",
+            sampling_decision: "in",
+          });
+        }
+
+        if (!queue) {
+          throw new Error("Failed to instantiate ingestion queue");
+        }
+
+        await queue.add(
+          QueueJobs.IngestionJob,
+          {
+            id: randomUUID(),
+            timestamp: new Date(),
+            name: QueueJobs.IngestionJob as const,
+            payload: {
+              data: {
+                type: eventData.type,
+                eventBodyId: eventData.eventBodyId,
+                fileKey: eventData.key,
+                skipS3List: shouldSkipS3List,
+                forwardToEventsTable,
+              },
+              authCheck: authCheck as {
+                validKey: true;
+                scope: {
+                  projectId: string;
+                  accessLevel: "project" | "scores";
+                };
               },
             },
-            { delay: getDelay(delay, source) },
-          )
-        : Promise.reject("Failed to instantiate ingestion queue");
-    }),
+          },
+          { delay: getDelay(delay, source) },
+        );
+
+        return { eventBodyId: id, sampledOut: false, eventIds: eventData.data.map((e) => e.id) };
+      }),
   );
 
+  const successfulEventIds: Set<string> = new Set();
+  enqueueResults.forEach((result, index) => {
+    const eventBodyIds = Object.keys(sortedBatchByEventBodyId).filter(
+      (id) => !failedEventBodyIds.has(id),
+    );
+    const eventBodyId = eventBodyIds[index];
+    const group = sortedBatchByEventBodyId[eventBodyId];
+
+    if (result.status === "fulfilled") {
+      group.data.forEach((e) => successfulEventIds.add(e.id));
+    } else {
+      group.data.forEach((e) => {
+        processingErrors.push({
+          id: e.id,
+          error: new Error("Failed to enqueue event for processing"),
+        });
+      });
+      logger.error("Failed to enqueue ingestion event", {
+        error: result.reason,
+        projectId: authCheck.scope.projectId,
+        eventBodyId,
+      });
+    }
+  });
+
+  const successfulEvents = sortedBatch.filter((e) => successfulEventIds.has(e.id));
+
   return aggregateBatchResult(
-    [...validationErrors, ...authenticationErrors],
-    sortedBatch.map((event) => ({ id: event.id, result: event })),
+    [...validationErrors, ...authenticationErrors, ...processingErrors],
+    successfulEvents.map((event) => ({ id: event.id, result: event })),
     authCheck.scope.projectId,
   );
 };
