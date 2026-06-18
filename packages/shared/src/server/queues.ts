@@ -25,6 +25,7 @@ export const IngestionEvent = z.object({
     fileKey: z.string().optional(),
     skipS3List: z.boolean().optional(),
     forwardToEventsTable: z.boolean().optional(),
+    retryEventIds: z.array(z.string()).optional(),
   }),
   authCheck: z.object({
     validKey: z.literal(true),

@@ -46,6 +46,7 @@ interface FileOutcomeGroup {
   hasRetryableFailure: boolean;
   hasSuccess: boolean;
   hasNonRetryableFailure: boolean;
+  retryableEventIds: string[];
 }
 
 const groupOutcomesByFile = (
@@ -65,6 +66,7 @@ const groupOutcomesByFile = (
       hasRetryableFailure: false,
       hasSuccess: false,
       hasNonRetryableFailure: false,
+      retryableEventIds: [],
     });
   }
 
@@ -80,6 +82,7 @@ const groupOutcomesByFile = (
         hasRetryableFailure: false,
         hasSuccess: false,
         hasNonRetryableFailure: false,
+        retryableEventIds: [],
       };
       fileToOutcomes.set(fileKey, group);
     }
@@ -93,6 +96,7 @@ const groupOutcomesByFile = (
         group.hasNonRetryableFailure = true;
       } else {
         group.hasRetryableFailure = true;
+        group.retryableEventIds.push(eo.eventId);
       }
     }
   }
@@ -112,6 +116,18 @@ const groupOutcomesByFile = (
 
 const getRetryableFiles = (groups: FileOutcomeGroup[]): string[] => {
   return groups.filter((g) => g.hasRetryableFailure).map((g) => g.fileKey);
+};
+
+const getRetryableEventIdsByFile = (
+  groups: FileOutcomeGroup[],
+): Map<string, string[]> => {
+  const map = new Map<string, string[]>();
+  for (const g of groups) {
+    if (g.hasRetryableFailure && g.retryableEventIds.length > 0) {
+      map.set(g.fileKey, g.retryableEventIds);
+    }
+  }
+  return map;
 };
 
 const shouldRetryBasedOnOutcomes = (
@@ -571,6 +587,29 @@ export const ingestionQueueProcessorBuilder = (
           .sort()
           .shift() ?? new Date();
 
+      const retryEventIds = (
+        job.data.payload.data as typeof job.data.payload.data & {
+          retryEventIds?: string[];
+        }
+      ).retryEventIds;
+      if (retryEventIds && retryEventIds.length > 0) {
+        const totalEvents = events.length;
+        const allowedIds = new Set(retryEventIds);
+        const filteredEvents = events.filter((e) => allowedIds.has(e.id));
+
+        logger.debug(
+          `Filtering retry events for project ${projectId}, eventBody ${eventBodyId}: ${filteredEvents.length}/${totalEvents} events in retry list`,
+          {
+            retryEventIdsCount: retryEventIds.length,
+            filteredOut: totalEvents - filteredEvents.length,
+            remaining: filteredEvents.length,
+          },
+        );
+
+        events.length = 0;
+        events.push(...filteredEvents);
+      }
+
       if (events.length === 0) {
         logger.warn(
           `No events found for project ${projectId} and event ${eventBodyId}`,
@@ -639,11 +678,17 @@ export const ingestionQueueProcessorBuilder = (
         s3Prefix,
       );
       const retryableFileKeys = getRetryableFiles(fileGroups);
+      const retryableEventIdsByFile = getRetryableEventIdsByFile(fileGroups);
 
       if (retryableFileKeys.length > 0) {
         logger.warn(
           `Retrying ${retryableFileKeys.length} files for project ${projectId}, eventBody ${eventBodyId}`,
-          { retryableFileKeys },
+          {
+            retryableFileKeys,
+            retryableEventIdsCount: [
+              ...retryableEventIdsByFile.values(),
+            ].reduce((a, b) => a + b.length, 0),
+          },
         );
         recordIncrement(
           "langfuse.ingestion.outcome.retry",
@@ -661,6 +706,7 @@ export const ingestionQueueProcessorBuilder = (
 
         if (queue) {
           for (const fileKey of retryableFileKeys) {
+            const retryEventIds = retryableEventIdsByFile.get(fileKey);
             await queue.add(
               enableRedirectToSecondaryQueue
                 ? QueueName.IngestionQueue
@@ -675,6 +721,9 @@ export const ingestionQueueProcessorBuilder = (
                     ...job.data.payload.data,
                     fileKey,
                     skipS3List: true,
+                    ...(retryEventIds?.length
+                      ? { retryEventIds }
+                      : ({} as { retryEventIds?: string[] })),
                   },
                 },
               },
@@ -719,12 +768,16 @@ export const ingestionQueueProcessorBuilder = (
           s3Prefix,
         );
         const retryableFileKeys = getRetryableFiles(fileGroups);
+        const retryableEventIdsByFile = getRetryableEventIdsByFile(fileGroups);
 
         if (retryableFileKeys.length > 0) {
           logger.warn(
             `Retrying ${retryableFileKeys.length} files (catch path) for project ${projectId}, eventBody ${eventBodyId}`,
             {
               retryableFileKeys,
+              retryableEventIdsCount: [
+                ...retryableEventIdsByFile.values(),
+              ].reduce((a, b) => a + b.length, 0),
               error: e instanceof Error ? e.message : String(e),
             },
           );
@@ -744,6 +797,7 @@ export const ingestionQueueProcessorBuilder = (
 
           if (queue) {
             for (const fileKey of retryableFileKeys) {
+              const retryEventIds = retryableEventIdsByFile.get(fileKey);
               await queue.add(
                 enableRedirectToSecondaryQueue
                   ? QueueName.IngestionQueue
@@ -758,6 +812,9 @@ export const ingestionQueueProcessorBuilder = (
                       ...job.data.payload.data,
                       fileKey,
                       skipS3List: true,
+                      ...(retryEventIds?.length
+                        ? { retryEventIds }
+                        : ({} as { retryEventIds?: string[] })),
                     },
                   },
                 },

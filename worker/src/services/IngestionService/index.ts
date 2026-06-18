@@ -746,7 +746,8 @@ export class IngestionService {
       }
     }
 
-    let mergeStage = IngestionEventOutcomeStage.MERGE;
+    let mergeStage: (typeof IngestionEventOutcomeStage)[keyof typeof IngestionEventOutcomeStage] =
+      IngestionEventOutcomeStage.MERGE;
     try {
       const clickhouseScoreRecord = await this.getClickhouseRecord({
         projectId,
@@ -840,7 +841,8 @@ export class IngestionService {
     const timeSortedEvents =
       IngestionService.toTimeSortedEventList(traceEventList);
 
-    let currentStage = IngestionEventOutcomeStage.VALIDATION;
+    let currentStage: (typeof IngestionEventOutcomeStage)[keyof typeof IngestionEventOutcomeStage] =
+      IngestionEventOutcomeStage.VALIDATION;
 
     try {
       const traceRecords = this.mapTraceEventsToRecords({
@@ -1019,7 +1021,8 @@ export class IngestionService {
 
     if (observationEventList.length === 0) return outcomes;
 
-    let currentStage = IngestionEventOutcomeStage.VALIDATION;
+    let currentStage: (typeof IngestionEventOutcomeStage)[keyof typeof IngestionEventOutcomeStage] =
+      IngestionEventOutcomeStage.VALIDATION;
 
     try {
       const timeSortedEvents =
@@ -1877,7 +1880,9 @@ export class IngestionService {
       case eventTypes.GUARDRAIL_CREATE:
         return "GUARDRAIL" as const;
       default:
-        throw new Error(`Unknown observation type: ${observation.type}`);
+        throw new Error(
+          `Unknown observation type: ${(observation as ObservationEvent).type}`,
+        );
     }
   }
 
