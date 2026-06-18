@@ -30,6 +30,52 @@ import { ClickhouseWriter, TableName } from "../services/ClickhouseWriter";
 import { chunk } from "lodash";
 import { randomUUID } from "crypto";
 
+const NON_RETRYABLE_STAGES: ReadonlySet<
+  (typeof IngestionEventOutcomeStage)[keyof typeof IngestionEventOutcomeStage]
+> = new Set([
+  IngestionEventOutcomeStage.VALIDATION,
+  IngestionEventOutcomeStage.S3_PARSE,
+]);
+
+const shouldRetryBasedOnOutcomes = (
+  fileOutcomes: IngestionFileOutcome[],
+  eventOutcomes: IngestionEventOutcome[],
+): { retry: boolean; reason?: string } => {
+  const failedFiles = fileOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.FAILED,
+  );
+  const failedEvents = eventOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.FAILED,
+  );
+
+  if (failedFiles.length === 0 && failedEvents.length === 0) {
+    return { retry: false };
+  }
+
+  const retryableFileFailures = failedFiles.filter(
+    (o) => !NON_RETRYABLE_STAGES.has(o.stage),
+  );
+  const retryableEventFailures = failedEvents.filter(
+    (o) => !NON_RETRYABLE_STAGES.has(o.stage),
+  );
+
+  if (retryableFileFailures.length > 0 || retryableEventFailures.length > 0) {
+    const stages = new Set([
+      ...retryableFileFailures.map((o) => o.stage),
+      ...retryableEventFailures.map((o) => o.stage),
+    ]);
+    return {
+      retry: true,
+      reason: `Retryable failures at stages: ${[...stages].join(", ")} (files: ${retryableFileFailures.length}, events: ${retryableEventFailures.length})`,
+    };
+  }
+
+  return {
+    retry: false,
+    reason: `All ${failedFiles.length + failedEvents.length} failures are non-retryable (VALIDATION/S3_PARSE)`,
+  };
+};
+
 const reportOutcomes = (
   fileOutcomes: IngestionFileOutcome[],
   eventOutcomes: IngestionEventOutcome[],
@@ -486,6 +532,28 @@ export const ingestionQueueProcessorBuilder = (
       eventOutcomes.push(...mergeOutcomes);
 
       reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
+
+      const retryDecision = shouldRetryBasedOnOutcomes(
+        fileOutcomes,
+        eventOutcomes,
+      );
+      if (retryDecision.retry) {
+        logger.warn(
+          `Retrying ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
+        );
+        recordIncrement("langfuse.ingestion.outcome.retry", 1, {
+          projectId,
+          reason: retryDecision.reason ?? "unknown",
+        });
+        throw new Error(
+          `Ingestion outcome retry: ${retryDecision.reason} for project ${projectId}, eventBody ${eventBodyId}`,
+        );
+      }
+      if (retryDecision.reason) {
+        logger.debug(
+          `Not retrying ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
+        );
+      }
     } catch (e) {
       // Check if this is a SlowDown error and mark the project for secondary queue
       if (isS3SlowDownError(e)) {
@@ -500,7 +568,29 @@ export const ingestionQueueProcessorBuilder = (
       traceException(e);
 
       reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
-      throw e;
+
+      const retryDecision = shouldRetryBasedOnOutcomes(
+        fileOutcomes,
+        eventOutcomes,
+      );
+      if (retryDecision.retry) {
+        logger.warn(
+          `Retrying ingestion job (catch path) for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
+        );
+        recordIncrement("langfuse.ingestion.outcome.retry", 1, {
+          projectId,
+          reason: retryDecision.reason ?? "unknown",
+        });
+        throw e;
+      }
+
+      logger.warn(
+        `Discarding ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason ?? "non-retryable failures"}`,
+      );
+      recordIncrement("langfuse.ingestion.outcome.discard", 1, {
+        projectId,
+        reason: retryDecision.reason ?? "non-retryable",
+      });
     }
   };
 };
