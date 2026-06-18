@@ -823,6 +823,50 @@ export const createIngestionEventSchema = (isLangfuseInternal = false) => {
     : publicSchemas.ingestionEvent;
 };
 
+export const IngestionEventOutcomeStatus = {
+  SUCCESS: "SUCCESS",
+  FAILED: "FAILED",
+  SKIPPED: "SKIPPED",
+} as const;
+
+export type IngestionEventOutcomeStatus =
+  (typeof IngestionEventOutcomeStatus)[keyof typeof IngestionEventOutcomeStatus];
+
+export const IngestionEventOutcomeStage = {
+  S3_DOWNLOAD: "S3_DOWNLOAD",
+  S3_PARSE: "S3_PARSE",
+  VALIDATION: "VALIDATION",
+  MERGE: "MERGE",
+  WRITE: "WRITE",
+} as const;
+
+export type IngestionEventOutcomeStage =
+  (typeof IngestionEventOutcomeStage)[keyof typeof IngestionEventOutcomeStage];
+
+export interface IngestionEventOutcome {
+  eventId: string;
+  eventBodyId: string;
+  projectId: string;
+  eventType: string;
+  status: IngestionEventOutcomeStatus;
+  stage: IngestionEventOutcomeStage;
+  error?: string;
+  errorDetails?: unknown;
+  timestamp: number;
+}
+
+export interface IngestionFileOutcome {
+  file: string;
+  eventBodyId: string;
+  projectId: string;
+  status: IngestionEventOutcomeStatus;
+  stage: IngestionEventOutcomeStage;
+  error?: string;
+  errorDetails?: unknown;
+  timestamp: number;
+  eventCount?: number;
+}
+
 export type ObservationEvent =
   | z.infer<typeof legacyObservationCreateEvent>
   | z.infer<typeof legacyObservationUpdateEvent>

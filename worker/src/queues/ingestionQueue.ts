@@ -6,6 +6,10 @@ import {
   getS3EventStorageClient,
   hasS3SlowdownFlag,
   IngestionEventType,
+  IngestionEventOutcome,
+  IngestionEventOutcomeStage,
+  IngestionEventOutcomeStatus,
+  IngestionFileOutcome,
   isS3SlowDownError,
   logger,
   markProjectS3Slowdown,
@@ -26,6 +30,109 @@ import { ClickhouseWriter, TableName } from "../services/ClickhouseWriter";
 import { chunk } from "lodash";
 import { randomUUID } from "crypto";
 
+const reportOutcomes = (
+  fileOutcomes: IngestionFileOutcome[],
+  eventOutcomes: IngestionEventOutcome[],
+  projectId: string,
+  eventBodyId: string,
+) => {
+  const totalFiles = fileOutcomes.length;
+  const successfulFiles = fileOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.SUCCESS,
+  ).length;
+  const failedFiles = fileOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.FAILED,
+  ).length;
+
+  const totalEvents = eventOutcomes.length;
+  const successfulEvents = eventOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.SUCCESS,
+  ).length;
+  const failedEvents = eventOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.FAILED,
+  ).length;
+  const skippedEvents = eventOutcomes.filter(
+    (o) => o.status === IngestionEventOutcomeStatus.SKIPPED,
+  ).length;
+
+  recordIncrement("langfuse.ingestion.outcome.files", totalFiles, {
+    projectId,
+    status: "total",
+  });
+  recordIncrement("langfuse.ingestion.outcome.files", successfulFiles, {
+    projectId,
+    status: "success",
+  });
+  recordIncrement("langfuse.ingestion.outcome.files", failedFiles, {
+    projectId,
+    status: "failed",
+  });
+
+  recordIncrement("langfuse.ingestion.outcome.events", totalEvents, {
+    projectId,
+    status: "total",
+  });
+  recordIncrement("langfuse.ingestion.outcome.events", successfulEvents, {
+    projectId,
+    status: "success",
+  });
+  recordIncrement("langfuse.ingestion.outcome.events", failedEvents, {
+    projectId,
+    status: "failed",
+  });
+  recordIncrement("langfuse.ingestion.outcome.events", skippedEvents, {
+    projectId,
+    status: "skipped",
+  });
+
+  if (failedFiles > 0 || failedEvents > 0) {
+    logger.warn(
+      `Ingestion outcome summary for project ${projectId}, eventBody ${eventBodyId}`,
+      {
+        files: {
+          total: totalFiles,
+          success: successfulFiles,
+          failed: failedFiles,
+        },
+        events: {
+          total: totalEvents,
+          success: successfulEvents,
+          failed: failedEvents,
+          skipped: skippedEvents,
+        },
+        failedFiles: fileOutcomes
+          .filter((o) => o.status === IngestionEventOutcomeStatus.FAILED)
+          .map((o) => ({ file: o.file, stage: o.stage, error: o.error })),
+        failedEvents: eventOutcomes
+          .filter((o) => o.status === IngestionEventOutcomeStatus.FAILED)
+          .map((o) => ({
+            eventId: o.eventId,
+            eventType: o.eventType,
+            stage: o.stage,
+            error: o.error,
+          })),
+      },
+    );
+  } else {
+    logger.debug(
+      `Ingestion outcome summary for project ${projectId}, eventBody ${eventBodyId}`,
+      {
+        files: {
+          total: totalFiles,
+          success: successfulFiles,
+          failed: failedFiles,
+        },
+        events: {
+          total: totalEvents,
+          success: successfulEvents,
+          failed: failedEvents,
+          skipped: skippedEvents,
+        },
+      },
+    );
+  }
+};
+
 export const ingestionQueueProcessorBuilder = (
   enableRedirectToSecondaryQueue: boolean,
 ): Processor => {
@@ -34,6 +141,11 @@ export const ingestionQueueProcessorBuilder = (
     [];
 
   return async (job: Job<TQueueJobTypes[QueueName.IngestionQueue]>) => {
+    const fileOutcomes: IngestionFileOutcome[] = [];
+    const eventOutcomes: IngestionEventOutcome[] = [];
+    const projectId = job.data.payload.authCheck.scope.projectId;
+    const eventBodyId = job.data.payload.data.eventBodyId;
+
     try {
       const span = getCurrentSpan();
       if (span) {
@@ -86,7 +198,7 @@ export const ingestionQueueProcessorBuilder = (
         redis &&
         job.data.payload.data.fileKey
       ) {
-        const key = `langfuse:ingestion:recently-processed:${job.data.payload.authCheck.scope.projectId}:${job.data.payload.data.type}:${job.data.payload.data.eventBodyId}:${job.data.payload.data.fileKey}`;
+        const key = `langfuse:ingestion:recently-processed:${projectId}:${job.data.payload.data.type}:${eventBodyId}:${job.data.payload.data.fileKey}`;
         const exists = await redis.exists(key);
         if (exists) {
           recordIncrement("langfuse.ingestion.recently_processed_cache", 1, {
@@ -94,8 +206,9 @@ export const ingestionQueueProcessorBuilder = (
             skipped: "true",
           });
           logger.debug(
-            `Skipping ingestion event ${job.data.payload.data.fileKey} for project ${job.data.payload.authCheck.scope.projectId}`,
+            `Skipping ingestion event ${job.data.payload.data.fileKey} for project ${projectId}`,
           );
+          reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
           return;
         } else {
           recordIncrement("langfuse.ingestion.recently_processed_cache", 1, {
@@ -106,7 +219,6 @@ export const ingestionQueueProcessorBuilder = (
       }
 
       // Check if project should be redirected to secondary queue
-      const projectId = job.data.payload.authCheck.scope.projectId;
       const shouldRedirectEnv =
         projectIdsToRedirectToSecondaryQueue.includes(projectId);
       const shouldRedirectSlowdown = await hasS3SlowdownFlag(projectId);
@@ -121,13 +233,13 @@ export const ingestionQueueProcessorBuilder = (
             reason: shouldRedirectSlowdown ? "s3_slowdown_flag" : "env_config",
           },
         );
-        const shardingKey = `${projectId}-${job.data.payload.data.eventBodyId}`;
+        const shardingKey = `${projectId}-${eventBodyId}`;
         const secondaryQueue = SecondaryIngestionQueue.getInstance({
           shardingKey,
         });
         if (secondaryQueue) {
           await secondaryQueue.add(QueueName.IngestionSecondaryQueue, job.data);
-          // If we don't redirect, we continue with the ingestion. Otherwise, we finish here.
+          reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
           return;
         }
       }
@@ -177,16 +289,42 @@ export const ingestionQueueProcessorBuilder = (
           totalS3DownloadSizeBytes += fileSize;
 
           const parsedFile = JSON.parse(file);
-          events.push(...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]));
+          const parsedEvents = Array.isArray(parsedFile)
+            ? parsedFile
+            : [parsedFile];
+          events.push(...parsedEvents);
+
+          fileOutcomes.push({
+            file: filePath,
+            eventBodyId,
+            projectId,
+            status: IngestionEventOutcomeStatus.SUCCESS,
+            stage: IngestionEventOutcomeStage.S3_PARSE,
+            timestamp: Date.now(),
+            eventCount: parsedEvents.length,
+          });
         } catch (e) {
           logger.error(
-            `Failed to download or parse S3 file ${filePath} for project ${job.data.payload.authCheck.scope.projectId}`,
+            `Failed to download or parse S3 file ${filePath} for project ${projectId}`,
             e,
           );
           recordIncrement("langfuse.ingestion.s3_file_download_failure", 1, {
             skippedS3List: "true",
           });
           eventFiles = eventFiles.filter((f) => f.file !== filePath);
+
+          fileOutcomes.push({
+            file: filePath,
+            eventBodyId,
+            projectId,
+            status: IngestionEventOutcomeStatus.FAILED,
+            stage: filePath.includes("download")
+              ? IngestionEventOutcomeStage.S3_DOWNLOAD
+              : IngestionEventOutcomeStage.S3_PARSE,
+            error: e instanceof Error ? e.message : String(e),
+            errorDetails: e,
+            timestamp: Date.now(),
+          });
         }
       } else {
         eventFiles = await s3Client.listFiles(s3Prefix);
@@ -204,19 +342,34 @@ export const ingestionQueueProcessorBuilder = (
             totalS3DownloadSizeBytes += fileSize;
 
             const parsedFile = JSON.parse(file);
+            const parsedEvents = Array.isArray(parsedFile)
+              ? parsedFile
+              : [parsedFile];
             return {
               file: fileRef.file,
-              events: Array.isArray(parsedFile) ? parsedFile : [parsedFile],
+              events: parsedEvents,
               success: true,
             };
           } catch (e) {
             logger.error(
-              `Failed to download or parse S3 file ${fileRef.file} for project ${job.data.payload.authCheck.scope.projectId}`,
+              `Failed to download or parse S3 file ${fileRef.file} for project ${projectId}`,
               e,
             );
             recordIncrement("langfuse.ingestion.s3_file_download_failure", 1, {
               skippedS3List: "false",
             });
+
+            fileOutcomes.push({
+              file: fileRef.file,
+              eventBodyId,
+              projectId,
+              status: IngestionEventOutcomeStatus.FAILED,
+              stage: IngestionEventOutcomeStage.S3_DOWNLOAD,
+              error: e instanceof Error ? e.message : String(e),
+              errorDetails: e,
+              timestamp: Date.now(),
+            });
+
             return { file: fileRef.file, events: [], success: false };
           }
         };
@@ -232,6 +385,16 @@ export const ingestionQueueProcessorBuilder = (
             if (result.success) {
               events.push(...result.events);
               successfullyProcessedFiles.push(result.file);
+
+              fileOutcomes.push({
+                file: result.file,
+                eventBodyId,
+                projectId,
+                status: IngestionEventOutcomeStatus.SUCCESS,
+                stage: IngestionEventOutcomeStage.S3_PARSE,
+                timestamp: Date.now(),
+                eventCount: result.events.length,
+              });
             }
           }
         }
@@ -265,8 +428,9 @@ export const ingestionQueueProcessorBuilder = (
 
       if (events.length === 0) {
         logger.warn(
-          `No events found for project ${job.data.payload.authCheck.scope.projectId} and event ${job.data.payload.data.eventBodyId}`,
+          `No events found for project ${projectId} and event ${eventBodyId}`,
         );
+        reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
         return;
       }
 
@@ -280,7 +444,7 @@ export const ingestionQueueProcessorBuilder = (
               .map((e) => e.file.split("/").pop() ?? "")
               .map((key) =>
                 redis!.set(
-                  `langfuse:ingestion:recently-processed:${job.data.payload.authCheck.scope.projectId}:${job.data.payload.data.type}:${job.data.payload.data.eventBodyId}:${key.replace(".json", "")}`,
+                  `langfuse:ingestion:recently-processed:${projectId}:${job.data.payload.data.type}:${eventBodyId}:${key.replace(".json", "")}`,
                   "1",
                   "EX",
                   60 * 5, // 5 minutes
@@ -305,23 +469,26 @@ export const ingestionQueueProcessorBuilder = (
         job.data.payload.data.forwardToEventsTable ??
         v4WritesToEventsTable(env);
 
-      await new IngestionService(
+      const mergeOutcomes = await new IngestionService(
         redis,
         prisma,
         clickhouseWriter,
         clickhouseClient(),
       ).mergeAndWrite(
         getClickhouseEntityType(events[0].type),
-        job.data.payload.authCheck.scope.projectId,
-        job.data.payload.data.eventBodyId,
+        projectId,
+        eventBodyId,
         firstS3WriteTime,
         events,
         forwardToEventsTable,
       );
+
+      eventOutcomes.push(...mergeOutcomes);
+
+      reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
     } catch (e) {
       // Check if this is a SlowDown error and mark the project for secondary queue
       if (isS3SlowDownError(e)) {
-        const projectId = job.data.payload.authCheck.scope.projectId;
         logger.warn(
           "S3 SlowDown error during ingestion processing, marking project for secondary queue",
           { projectId, error: e },
@@ -329,11 +496,10 @@ export const ingestionQueueProcessorBuilder = (
         await markProjectS3Slowdown(projectId);
       }
 
-      logger.error(
-        `Failed job ingestion processing for ${job.data.payload.authCheck.scope.projectId}`,
-        e,
-      );
+      logger.error(`Failed job ingestion processing for ${projectId}`, e);
       traceException(e);
+
+      reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
       throw e;
     }
   };
