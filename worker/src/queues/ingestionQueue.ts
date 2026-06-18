@@ -10,9 +10,11 @@ import {
   IngestionEventOutcomeStage,
   IngestionEventOutcomeStatus,
   IngestionFileOutcome,
+  IngestionQueue,
   isS3SlowDownError,
   logger,
   markProjectS3Slowdown,
+  QueueJobs,
   QueueName,
   recordDistribution,
   recordHistogram,
@@ -36,6 +38,81 @@ const NON_RETRYABLE_STAGES: ReadonlySet<
   IngestionEventOutcomeStage.VALIDATION,
   IngestionEventOutcomeStage.S3_PARSE,
 ]);
+
+interface FileOutcomeGroup {
+  fileKey: string;
+  fileOutcome?: IngestionFileOutcome;
+  eventOutcomes: IngestionEventOutcome[];
+  hasRetryableFailure: boolean;
+  hasSuccess: boolean;
+  hasNonRetryableFailure: boolean;
+}
+
+const groupOutcomesByFile = (
+  fileOutcomes: IngestionFileOutcome[],
+  eventOutcomes: IngestionEventOutcome[],
+  eventToFileMap: Map<string, string>,
+  s3Prefix: string,
+): FileOutcomeGroup[] => {
+  const fileToOutcomes = new Map<string, FileOutcomeGroup>();
+
+  for (const fo of fileOutcomes) {
+    const fileKey = fo.file.replace(s3Prefix, "").replace(/\.json$/, "");
+    fileToOutcomes.set(fileKey, {
+      fileKey,
+      fileOutcome: fo,
+      eventOutcomes: [],
+      hasRetryableFailure: false,
+      hasSuccess: false,
+      hasNonRetryableFailure: false,
+    });
+  }
+
+  for (const eo of eventOutcomes) {
+    const fileKey = eventToFileMap.get(eo.eventId);
+    if (!fileKey) continue;
+
+    let group = fileToOutcomes.get(fileKey);
+    if (!group) {
+      group = {
+        fileKey,
+        eventOutcomes: [],
+        hasRetryableFailure: false,
+        hasSuccess: false,
+        hasNonRetryableFailure: false,
+      };
+      fileToOutcomes.set(fileKey, group);
+    }
+
+    group.eventOutcomes.push(eo);
+
+    if (eo.status === IngestionEventOutcomeStatus.SUCCESS) {
+      group.hasSuccess = true;
+    } else if (eo.status === IngestionEventOutcomeStatus.FAILED) {
+      if (NON_RETRYABLE_STAGES.has(eo.stage)) {
+        group.hasNonRetryableFailure = true;
+      } else {
+        group.hasRetryableFailure = true;
+      }
+    }
+  }
+
+  for (const group of fileToOutcomes.values()) {
+    if (group.fileOutcome?.status === IngestionEventOutcomeStatus.FAILED) {
+      if (NON_RETRYABLE_STAGES.has(group.fileOutcome.stage)) {
+        group.hasNonRetryableFailure = true;
+      } else {
+        group.hasRetryableFailure = true;
+      }
+    }
+  }
+
+  return [...fileToOutcomes.values()];
+};
+
+const getRetryableFiles = (groups: FileOutcomeGroup[]): string[] => {
+  return groups.filter((g) => g.hasRetryableFailure).map((g) => g.fileKey);
+};
 
 const shouldRetryBasedOnOutcomes = (
   fileOutcomes: IngestionFileOutcome[],
@@ -189,8 +266,13 @@ export const ingestionQueueProcessorBuilder = (
   return async (job: Job<TQueueJobTypes[QueueName.IngestionQueue]>) => {
     const fileOutcomes: IngestionFileOutcome[] = [];
     const eventOutcomes: IngestionEventOutcome[] = [];
+    const eventToFileMap = new Map<string, string>(); // eventId -> fileKey
     const projectId = job.data.payload.authCheck.scope.projectId;
     const eventBodyId = job.data.payload.data.eventBodyId;
+    const clickhouseEntityType = getClickhouseEntityType(
+      job.data.payload.data.type,
+    );
+    const s3Prefix = `${env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}${projectId}/${clickhouseEntityType}/${eventBodyId}/`;
 
     try {
       const span = getCurrentSpan();
@@ -305,9 +387,6 @@ export const ingestionQueueProcessorBuilder = (
       );
 
       // Download all events from folder into a local array
-      const clickhouseEntityType = getClickhouseEntityType(
-        job.data.payload.data.type,
-      );
 
       let eventFiles: { file: string; createdAt: Date }[] = [];
       const events: IngestionEventType[] = [];
@@ -316,7 +395,6 @@ export const ingestionQueueProcessorBuilder = (
       const shouldSkipS3List =
         // The producer sets skipS3List to true if it's an OTel observation
         job.data.payload.data.skipS3List && job.data.payload.data.fileKey;
-      const s3Prefix = `${env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}${job.data.payload.authCheck.scope.projectId}/${clickhouseEntityType}/${job.data.payload.data.eventBodyId}/`;
 
       let totalS3DownloadSizeBytes = 0;
 
@@ -339,6 +417,11 @@ export const ingestionQueueProcessorBuilder = (
             ? parsedFile
             : [parsedFile];
           events.push(...parsedEvents);
+
+          const fileKey = job.data.payload.data.fileKey!;
+          for (const event of parsedEvents) {
+            eventToFileMap.set(event.id, fileKey);
+          }
 
           fileOutcomes.push({
             file: filePath,
@@ -391,8 +474,17 @@ export const ingestionQueueProcessorBuilder = (
             const parsedEvents = Array.isArray(parsedFile)
               ? parsedFile
               : [parsedFile];
+
+            const fileKey = fileRef.file
+              .replace(s3Prefix, "")
+              .replace(/\.json$/, "");
+            for (const event of parsedEvents) {
+              eventToFileMap.set(event.id, fileKey);
+            }
+
             return {
               file: fileRef.file,
+              fileKey,
               events: parsedEvents,
               success: true,
             };
@@ -416,7 +508,14 @@ export const ingestionQueueProcessorBuilder = (
               timestamp: Date.now(),
             });
 
-            return { file: fileRef.file, events: [], success: false };
+            return {
+              file: fileRef.file,
+              fileKey: fileRef.file
+                .replace(s3Prefix, "")
+                .replace(/\.json$/, ""),
+              events: [],
+              success: false,
+            };
           }
         };
 
@@ -533,26 +632,69 @@ export const ingestionQueueProcessorBuilder = (
 
       reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
 
-      const retryDecision = shouldRetryBasedOnOutcomes(
+      const fileGroups = groupOutcomesByFile(
         fileOutcomes,
         eventOutcomes,
+        eventToFileMap,
+        s3Prefix,
       );
-      if (retryDecision.retry) {
+      const retryableFileKeys = getRetryableFiles(fileGroups);
+
+      if (retryableFileKeys.length > 0) {
         logger.warn(
-          `Retrying ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
+          `Retrying ${retryableFileKeys.length} files for project ${projectId}, eventBody ${eventBodyId}`,
+          { retryableFileKeys },
         );
-        recordIncrement("langfuse.ingestion.outcome.retry", 1, {
-          projectId,
-          reason: retryDecision.reason ?? "unknown",
-        });
-        throw new Error(
-          `Ingestion outcome retry: ${retryDecision.reason} for project ${projectId}, eventBody ${eventBodyId}`,
+        recordIncrement(
+          "langfuse.ingestion.outcome.retry",
+          retryableFileKeys.length,
+          {
+            projectId,
+            reason: "retryable_file_failures",
+          },
         );
-      }
-      if (retryDecision.reason) {
-        logger.debug(
-          `Not retrying ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
-        );
+
+        const shardingKey = `${projectId}-${eventBodyId}`;
+        const queue = enableRedirectToSecondaryQueue
+          ? IngestionQueue.getInstance({ shardingKey })
+          : SecondaryIngestionQueue.getInstance({ shardingKey });
+
+        if (queue) {
+          for (const fileKey of retryableFileKeys) {
+            await queue.add(
+              enableRedirectToSecondaryQueue
+                ? QueueName.IngestionQueue
+                : QueueName.IngestionSecondaryQueue,
+              {
+                id: randomUUID(),
+                timestamp: new Date(),
+                name: QueueJobs.IngestionJob,
+                payload: {
+                  ...job.data.payload,
+                  data: {
+                    ...job.data.payload.data,
+                    fileKey,
+                    skipS3List: true,
+                  },
+                },
+              },
+            );
+          }
+        } else {
+          logger.error(
+            "Failed to get ingestion queue instance for retry, dropping retries",
+            { projectId, eventBodyId, retryableFileKeys },
+          );
+        }
+
+        const skippedFiles = fileGroups.filter(
+          (g) => !g.hasRetryableFailure,
+        ).length;
+        if (skippedFiles > 0) {
+          logger.debug(
+            `Skipped ${skippedFiles} files in retry for project ${projectId}, eventBody ${eventBodyId} (already succeeded or non-retryable failures)`,
+          );
+        }
       }
     } catch (e) {
       // Check if this is a SlowDown error and mark the project for secondary queue
@@ -569,28 +711,84 @@ export const ingestionQueueProcessorBuilder = (
 
       reportOutcomes(fileOutcomes, eventOutcomes, projectId, eventBodyId);
 
-      const retryDecision = shouldRetryBasedOnOutcomes(
-        fileOutcomes,
-        eventOutcomes,
-      );
-      if (retryDecision.retry) {
+      if (fileOutcomes.length > 0) {
+        const fileGroups = groupOutcomesByFile(
+          fileOutcomes,
+          eventOutcomes,
+          eventToFileMap,
+          s3Prefix,
+        );
+        const retryableFileKeys = getRetryableFiles(fileGroups);
+
+        if (retryableFileKeys.length > 0) {
+          logger.warn(
+            `Retrying ${retryableFileKeys.length} files (catch path) for project ${projectId}, eventBody ${eventBodyId}`,
+            {
+              retryableFileKeys,
+              error: e instanceof Error ? e.message : String(e),
+            },
+          );
+          recordIncrement(
+            "langfuse.ingestion.outcome.retry",
+            retryableFileKeys.length,
+            {
+              projectId,
+              reason: "retryable_file_failures_catch",
+            },
+          );
+
+          const shardingKey = `${projectId}-${eventBodyId}`;
+          const queue = enableRedirectToSecondaryQueue
+            ? IngestionQueue.getInstance({ shardingKey })
+            : SecondaryIngestionQueue.getInstance({ shardingKey });
+
+          if (queue) {
+            for (const fileKey of retryableFileKeys) {
+              await queue.add(
+                enableRedirectToSecondaryQueue
+                  ? QueueName.IngestionQueue
+                  : QueueName.IngestionSecondaryQueue,
+                {
+                  id: randomUUID(),
+                  timestamp: new Date(),
+                  name: QueueJobs.IngestionJob,
+                  payload: {
+                    ...job.data.payload,
+                    data: {
+                      ...job.data.payload.data,
+                      fileKey,
+                      skipS3List: true,
+                    },
+                  },
+                },
+              );
+            }
+          } else {
+            logger.error(
+              "Failed to get ingestion queue instance for retry, falling back to full job retry",
+              { projectId, eventBodyId },
+            );
+            throw e;
+          }
+        } else {
+          logger.warn(
+            `Discarding ingestion job for project ${projectId}, eventBody ${eventBodyId}: no retryable files`,
+          );
+          recordIncrement("langfuse.ingestion.outcome.discard", 1, {
+            projectId,
+            reason: "no_retryable_files",
+          });
+        }
+      } else {
         logger.warn(
-          `Retrying ingestion job (catch path) for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason}`,
+          `Retrying full ingestion job (catch path, no file outcomes yet) for project ${projectId}, eventBody ${eventBodyId}`,
         );
         recordIncrement("langfuse.ingestion.outcome.retry", 1, {
           projectId,
-          reason: retryDecision.reason ?? "unknown",
+          reason: "full_job_retry_no_file_outcomes",
         });
         throw e;
       }
-
-      logger.warn(
-        `Discarding ingestion job for project ${projectId}, eventBody ${eventBodyId}: ${retryDecision.reason ?? "non-retryable failures"}`,
-      );
-      recordIncrement("langfuse.ingestion.outcome.discard", 1, {
-        projectId,
-        reason: retryDecision.reason ?? "non-retryable",
-      });
     }
   };
 };
