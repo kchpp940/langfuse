@@ -133,65 +133,6 @@ const immutableEntityKeys: {
   ],
 };
 
-export type MergeOperationStatus = "success" | "failed" | "skipped";
-
-export interface MergeOperationResult {
-  status: MergeOperationStatus;
-  error?: Error;
-}
-
-export interface S3ProcessedFile {
-  s3FileKey: string;      // S3 file path (e.g. "evt1.json")
-  eventIds: string[];     // event ids contained in this file
-  processed: boolean;     // whether this file's events were passed to mergeAndWrite
-}
-
-export interface MergeAndWriteResult {
-  // Overall success: true if all critical operations succeeded.
-  // If critical ops succeeded but some secondary ops failed, this is still true.
-  success: boolean;
-  eventBodyId: string;
-  eventType: IngestionEntityTypes;
-  eventCount: number;
-  // Raw events that were attempted to be merged. Retained for re-enqueue on failure.
-  rawEvents: IngestionEventType[];
-  // S3 files that were downloaded and parsed successfully (eligible for "seen" cache)
-  s3Files: S3ProcessedFile[];
-  critical: {
-    // Core ClickHouse table write (Traces/Observations/Scores/DatasetRunItems)
-    mainTableWrite: MergeOperationResult;
-    // Prisma session upsert (traces only, ON CONFLICT DO NOTHING)
-    sessionUpsert: MergeOperationResult;
-    // Dataset item lookup (dataset_run_items only)
-    datasetItemLookup: MergeOperationResult;
-  };
-  secondary: {
-    // Dual-write to staging table (v4 events pipeline)
-    stagingTableWrite: MergeOperationResult;
-    // TraceUpsertQueue for eval pipeline
-    traceUpsertQueue: MergeOperationResult;
-    // Observation -> wrapper trace write (backward compat)
-    wrapperTraceWrite: MergeOperationResult;
-    // Score validation (per-score skip, not fatal)
-    scoreValidation: MergeOperationResult;
-  };
-  // Top-level error for critical failures
-  error?: Error;
-}
-
-const EMPTY_CRITICAL = {
-  mainTableWrite: { status: "skipped" as MergeOperationStatus },
-  sessionUpsert: { status: "skipped" as MergeOperationStatus },
-  datasetItemLookup: { status: "skipped" as MergeOperationStatus },
-};
-
-const EMPTY_SECONDARY = {
-  stagingTableWrite: { status: "skipped" as MergeOperationStatus },
-  traceUpsertQueue: { status: "skipped" as MergeOperationStatus },
-  wrapperTraceWrite: { status: "skipped" as MergeOperationStatus },
-  scoreValidation: { status: "skipped" as MergeOperationStatus },
-};
-
 export class IngestionService {
   private promptService: PromptService;
 
@@ -211,85 +152,44 @@ export class IngestionService {
     createdAtTimestamp: Date,
     events: IngestionEventType[],
     forwardToEventsTable: boolean,
-    s3Files: S3ProcessedFile[] = [],
-  ): Promise<MergeAndWriteResult> {
+  ): Promise<void> {
     logger.debug(
       `Merging ingestion ${eventType} event for project ${projectId} and event ${eventBodyId}`,
     );
 
-    let result: MergeAndWriteResult = {
-      success: false,
-      eventBodyId,
-      eventType,
-      eventCount: events.length,
-      rawEvents: events,
-      s3Files,
-      critical: { ...EMPTY_CRITICAL },
-      secondary: { ...EMPTY_SECONDARY },
-    };
-
-    try {
-      switch (eventType) {
-        case "trace": {
-          result = await this.processTraceEventList({
-            projectId,
-            entityId: eventBodyId,
-            createdAtTimestamp,
-            traceEventList: events as TraceEventType[],
-            createEventTraceRecord: forwardToEventsTable,
-            baseResult: result,
-          });
-          break;
-        }
-        case "observation": {
-          result = await this.processObservationEventList({
-            projectId,
-            entityId: eventBodyId,
-            createdAtTimestamp,
-            observationEventList: events as ObservationEvent[],
-            writeToStagingTables: forwardToEventsTable,
-            baseResult: result,
-          });
-          break;
-        }
-        case "score": {
-          result = await this.processScoreEventList({
-            projectId,
-            entityId: eventBodyId,
-            createdAtTimestamp,
-            scoreEventList: events as ScoreEventType[],
-            baseResult: result,
-          });
-          break;
-        }
-        case "dataset_run_item": {
-          result = await this.processDatasetRunItemEventList({
-            projectId,
-            entityId: eventBodyId,
-            createdAtTimestamp,
-            datasetRunItemEventList: events as DatasetRunItemEventType[],
-            baseResult: result,
-          });
-          break;
-        }
+    switch (eventType) {
+      case "trace":
+        return await this.processTraceEventList({
+          projectId,
+          entityId: eventBodyId,
+          createdAtTimestamp,
+          traceEventList: events as TraceEventType[],
+          createEventTraceRecord: forwardToEventsTable,
+        });
+      case "observation":
+        return await this.processObservationEventList({
+          projectId,
+          entityId: eventBodyId,
+          createdAtTimestamp,
+          observationEventList: events as ObservationEvent[],
+          writeToStagingTables: forwardToEventsTable,
+        });
+      case "score": {
+        return await this.processScoreEventList({
+          projectId,
+          entityId: eventBodyId,
+          createdAtTimestamp,
+          scoreEventList: events as ScoreEventType[],
+        });
       }
-
-      // success = all critical ops succeeded; secondary ops do not block success
-      result.success =
-        result.critical.mainTableWrite.status === "success" &&
-        result.critical.sessionUpsert.status !== "failed" &&
-        result.critical.datasetItemLookup.status !== "failed";
-
-      return result;
-    } catch (error) {
-      logger.error(
-        `Unhandled failure in mergeAndWrite ${eventType} for project ${projectId} and event ${eventBodyId}`,
-        error,
-      );
-      traceException(error);
-      result.success = false;
-      result.error = error instanceof Error ? error : new Error(String(error));
-      return result;
+      case "dataset_run_item": {
+        return await this.processDatasetRunItemEventList({
+          projectId,
+          entityId: eventBodyId,
+          createdAtTimestamp,
+          datasetRunItemEventList: events as DatasetRunItemEventType[],
+        });
+      }
     }
   }
 
@@ -497,143 +397,106 @@ export class IngestionService {
     entityId: string;
     createdAtTimestamp: Date;
     datasetRunItemEventList: DatasetRunItemEventType[];
-    baseResult?: MergeAndWriteResult;
-  }): Promise<MergeAndWriteResult> {
+  }) {
     const { projectId, entityId, datasetRunItemEventList } = params;
-    const baseResult: MergeAndWriteResult = params.baseResult ?? {
-      success: false,
-      eventCount: datasetRunItemEventList.length,
-      critical: { ...EMPTY_CRITICAL },
-      secondary: { ...EMPTY_SECONDARY },
-    };
-    const result = { ...baseResult };
-    if (datasetRunItemEventList.length === 0) return result;
+    if (datasetRunItemEventList.length === 0) return;
 
-    const finalDatasetRunItemRecords: DatasetRunItemRecordInsertType[] = (
-      await Promise.all(
-        datasetRunItemEventList.map(
-          async (
-            event: DatasetRunItemEventType,
-          ): Promise<DatasetRunItemRecordInsertType[]> => {
-            try {
-              const [runData, itemData] = await Promise.all([
-                this.prisma.datasetRuns.findFirst({
-                  where: {
-                    id: event.body.runId,
-                    datasetId: event.body.datasetId,
-                    projectId,
-                  },
-                  select: {
-                    name: true,
-                    description: true,
-                    metadata: true,
-                    createdAt: true,
-                  },
-                }),
-                getDatasetItemById({
-                  projectId,
-                  datasetItemId: event.body.datasetItemId,
-                  datasetId: event.body.datasetId,
-                  version: event.body.datasetVersion
-                    ? new Date(event.body.datasetVersion)
-                    : undefined,
-                  status: "ACTIVE",
-                }),
-              ]);
+    const datasetRunItemRecordsPromises = datasetRunItemEventList.map(
+      async (
+        event: DatasetRunItemEventType,
+      ): Promise<DatasetRunItemRecordInsertType[]> => {
+        try {
+          const [runData, itemData] = await Promise.all([
+            this.prisma.datasetRuns.findFirst({
+              where: {
+                id: event.body.runId,
+                datasetId: event.body.datasetId,
+                projectId,
+              },
+              select: {
+                name: true,
+                description: true,
+                metadata: true,
+                createdAt: true,
+              },
+            }),
+            await getDatasetItemById({
+              projectId,
+              datasetItemId: event.body.datasetItemId,
+              datasetId: event.body.datasetId,
+              version: event.body.datasetVersion
+                ? new Date(event.body.datasetVersion)
+                : undefined,
+              status: "ACTIVE",
+            }),
+          ]);
 
-              if (!runData || !itemData) return [];
+          if (!runData || !itemData) return [];
 
-              const timestamp = event.body.createdAt
-                ? new Date(event.body.createdAt).getTime()
-                : new Date().getTime();
+          const timestamp = event.body.createdAt
+            ? new Date(event.body.createdAt).getTime()
+            : new Date().getTime();
 
-              const datasetItemVersion = itemData.validFrom
-                ? itemData.validFrom.getTime()
-                : null;
+          const datasetItemVersion = itemData.validFrom
+            ? itemData.validFrom.getTime()
+            : null;
 
-              return [
-                {
-                  id: entityId,
-                  project_id: projectId,
-                  dataset_run_id: event.body.runId,
-                  dataset_item_id: event.body.datasetItemId,
-                  dataset_id: event.body.datasetId,
-                  trace_id: event.body.traceId,
-                  observation_id: event.body.observationId,
-                  error: event.body.error,
-                  created_at: timestamp,
-                  updated_at: timestamp,
-                  event_ts: timestamp,
-                  is_deleted: 0,
-                  // enriched with run data
-                  dataset_run_name: runData.name,
-                  dataset_run_description: runData.description,
-                  dataset_run_metadata: runData.metadata
-                    ? convertPostgresJsonToMetadataRecord(runData.metadata)
-                    : {},
-                  dataset_run_created_at: runData.createdAt.getTime(),
-                  // enriched with item data
-                  dataset_item_version: datasetItemVersion,
-                  dataset_item_input: JSON.stringify(itemData.input),
-                  dataset_item_expected_output: JSON.stringify(
-                    itemData.expectedOutput,
-                  ),
-                  dataset_item_metadata: itemData.metadata
-                    ? convertPostgresJsonToMetadataRecord(itemData.metadata)
-                    : {},
-                },
-              ];
-            } catch (error) {
-              logger.warn(
-                `Failed to lookup dataset run/item for project ${projectId} dataset_run_item ${entityId}`,
-                error,
-              );
-              traceException(error);
-              // Per-event lookup failure is not fatal; we skip this event but continue others.
-              return [];
-            }
-          },
-        ),
-      )
-    ).flat();
-
-    // CRITICAL: Dataset item lookup (if ALL events had lookup failures, mark as failed lookup)
-    if (
-      finalDatasetRunItemRecords.length === 0 &&
-      datasetRunItemEventList.length > 0
-    ) {
-      result.critical.datasetItemLookup = {
-        status: "failed",
-        error: new Error(
-          "All dataset run item events failed lookup (run/item not found or DB error)",
-        ),
-      };
-      return result;
-    } else {
-      result.critical.datasetItemLookup = { status: "success" };
-    }
-
-    // CRITICAL: Main DatasetRunItems table write
-    try {
-      finalDatasetRunItemRecords.forEach((record) => {
-        if (record) {
-          this.clickHouseWriter.addToQueue(TableName.DatasetRunItems, record);
+          return [
+            {
+              id: entityId,
+              project_id: projectId,
+              dataset_run_id: event.body.runId,
+              dataset_item_id: event.body.datasetItemId,
+              dataset_id: event.body.datasetId,
+              trace_id: event.body.traceId,
+              observation_id: event.body.observationId,
+              error: event.body.error,
+              created_at: timestamp,
+              updated_at: timestamp,
+              event_ts: timestamp,
+              is_deleted: 0,
+              dataset_run_name: runData.name,
+              dataset_run_description: runData.description,
+              dataset_run_metadata: runData.metadata
+                ? convertPostgresJsonToMetadataRecord(runData.metadata)
+                : {},
+              dataset_run_created_at: runData.createdAt.getTime(),
+              dataset_item_version: datasetItemVersion,
+              dataset_item_input: JSON.stringify(itemData.input),
+              dataset_item_expected_output: JSON.stringify(
+                itemData.expectedOutput,
+              ),
+              dataset_item_metadata: itemData.metadata
+                ? convertPostgresJsonToMetadataRecord(itemData.metadata)
+                : {},
+            },
+          ];
+        } catch (error) {
+          logger.info(
+            `Failed to process dataset run item event for project ${projectId} and entity ${entityId}`,
+            error,
+          );
+          return [];
         }
-      });
-      result.critical.mainTableWrite = { status: "success" };
-    } catch (error) {
-      result.critical.mainTableWrite = {
-        status: "failed",
-        error: error instanceof Error ? error : new Error(String(error)),
-      };
-      logger.error(
-        `Failed to enqueue dataset run item records for project ${projectId} dataset_run_item ${entityId}`,
-        error,
-      );
-      traceException(error);
-    }
+      },
+    );
 
-    return result;
+    const results = await Promise.allSettled(datasetRunItemRecordsPromises);
+    const finalDatasetRunItemRecords: DatasetRunItemRecordInsertType[] = results
+      .filter(
+        (
+          result,
+        ): result is PromiseFulfilledResult<DatasetRunItemRecordInsertType[]> =>
+          result.status === "fulfilled",
+      )
+      .flatMap((result) => result.value)
+      .flat();
+
+    finalDatasetRunItemRecords.forEach((record) => {
+      if (record) {
+        this.clickHouseWriter.addToQueue(TableName.DatasetRunItems, record);
+      }
+    });
   }
 
   private async processScoreEventList(params: {
@@ -641,17 +504,9 @@ export class IngestionService {
     entityId: string;
     createdAtTimestamp: Date;
     scoreEventList: ScoreEventType[];
-    baseResult?: MergeAndWriteResult;
-  }): Promise<MergeAndWriteResult> {
+  }) {
     const { projectId, entityId, createdAtTimestamp, scoreEventList } = params;
-    const baseResult: MergeAndWriteResult = params.baseResult ?? {
-      success: false,
-      eventCount: scoreEventList.length,
-      critical: { ...EMPTY_CRITICAL },
-      secondary: { ...EMPTY_SECONDARY },
-    };
-    const result = { ...baseResult };
-    if (scoreEventList.length === 0) return result;
+    if (scoreEventList.length === 0) return;
 
     const timeSortedEvents =
       IngestionService.toTimeSortedEventList(scoreEventList);
@@ -722,24 +577,11 @@ export class IngestionService {
             return null;
           }
         }),
-      ).then((results) => {
-        const validRecords = results.filter(
+      ).then((results) =>
+        results.filter(
           (record): record is NonNullable<typeof record> => record !== null,
-        );
-        // If at least one score validated successfully, treat validation as overall success.
-        // If ALL scores failed validation, mark it as secondary failure (won't block retries but is logged).
-        if (validRecords.length === 0 && results.length > 0) {
-          result.secondary.scoreValidation = {
-            status: "failed",
-            error: new Error("All score events failed validation"),
-          };
-        } else if (validRecords.length < results.length) {
-          result.secondary.scoreValidation = { status: "success" };
-        } else {
-          result.secondary.scoreValidation = { status: "success" };
-        }
-        return validRecords;
-      }),
+        ),
+      ),
     ]);
 
     if (clickhouseScoreRecord) {
@@ -747,14 +589,6 @@ export class IngestionService {
         store: "clickhouse",
         object: "score",
       });
-    }
-
-    // If no valid score records remain after validation, don't attempt to write
-    if (scoreRecords.length === 0) {
-      logger.warn(
-        `No valid score records to write for project ${projectId} score ${entityId}`,
-      );
-      return result;
     }
 
     const finalScoreRecord: ScoreRecordInsertType =
@@ -765,23 +599,7 @@ export class IngestionService {
     finalScoreRecord.created_at =
       clickhouseScoreRecord?.created_at ?? createdAtTimestamp.getTime();
 
-    // CRITICAL: Main Scores table write
-    try {
-      this.clickHouseWriter.addToQueue(TableName.Scores, finalScoreRecord);
-      result.critical.mainTableWrite = { status: "success" };
-    } catch (error) {
-      result.critical.mainTableWrite = {
-        status: "failed",
-        error: error instanceof Error ? error : new Error(String(error)),
-      };
-      logger.error(
-        `Failed to enqueue score record for project ${projectId} score ${entityId}`,
-        error,
-      );
-      traceException(error);
-    }
-
-    return result;
+    this.clickHouseWriter.addToQueue(TableName.Scores, finalScoreRecord);
   }
 
   private async processTraceEventList(params: {
@@ -789,24 +607,16 @@ export class IngestionService {
     entityId: string;
     createdAtTimestamp: Date;
     traceEventList: TraceEventType[];
-    createEventTraceRecord?: boolean;
-    baseResult?: MergeAndWriteResult;
-  }): Promise<MergeAndWriteResult> {
+    createEventTraceRecord: boolean;
+  }) {
     const {
       projectId,
       entityId,
       createdAtTimestamp,
       traceEventList,
-      createEventTraceRecord = false,
+      createEventTraceRecord,
     } = params;
-    const baseResult: MergeAndWriteResult = params.baseResult ?? {
-      success: false,
-      eventCount: traceEventList.length,
-      critical: { ...EMPTY_CRITICAL },
-      secondary: { ...EMPTY_SECONDARY },
-    };
-    const result = { ...baseResult };
-    if (traceEventList.length === 0) return result;
+    if (traceEventList.length === 0) return;
 
     const timeSortedEvents =
       IngestionService.toTimeSortedEventList(traceEventList);
@@ -867,23 +677,9 @@ export class IngestionService {
     finalTraceRecord.input = finalIO.input ?? clickhouseTraceRecord?.input;
     finalTraceRecord.output = finalIO.output ?? clickhouseTraceRecord?.output;
 
-    // CRITICAL: Main Traces table write
-    try {
-      this.clickHouseWriter.addToQueue(TableName.Traces, finalTraceRecord);
-      result.critical.mainTableWrite = { status: "success" };
-    } catch (error) {
-      result.critical.mainTableWrite = {
-        status: "failed",
-        error: error instanceof Error ? error : new Error(String(error)),
-      };
-      logger.error(
-        `Failed to enqueue trace record for project ${projectId} trace ${entityId}`,
-        error,
-      );
-      traceException(error);
-    }
+    this.clickHouseWriter.addToQueue(TableName.Traces, finalTraceRecord);
 
-    // CRITICAL: Session upsert (ON CONFLICT DO NOTHING, so idempotent)
+    // If the trace has a sessionId, we upsert the corresponding session into Postgres.
     const traceRecordWithSession = traceRecords
       .slice()
       .reverse()
@@ -896,98 +692,58 @@ export class IngestionService {
           ON CONFLICT (id, project_id)
           DO NOTHING
         `;
-        result.critical.sessionUpsert = { status: "success" };
-      } catch (error) {
-        result.critical.sessionUpsert = {
-          status: "failed",
-          error: error instanceof Error ? error : new Error(String(error)),
-        };
+      } catch (e) {
         logger.error(
           `Failed to upsert session ${traceRecordWithSession.session_id}`,
-          error,
+          e,
         );
-        traceException(error);
       }
     }
 
-    // SECONDARY: Dual-write to staging table for batch propagation to events table
+    // Dual-write to staging table for batch propagation to events table
     // We pretend the trace is a "span" where span_id = trace_id
-    if (createEventTraceRecord && result.critical.mainTableWrite.status === "success") {
-      try {
-        const traceAsStagingObservation = convertTraceToStagingObservation(
-          finalTraceRecord,
-          this.getPartitionAwareTimestamp(createdAtTimestamp),
-        );
-        this.clickHouseWriter.addToQueue(
-          TableName.ObservationsBatchStaging,
-          traceAsStagingObservation,
-        );
-        result.secondary.stagingTableWrite = { status: "success" };
-      } catch (error) {
-        result.secondary.stagingTableWrite = {
-          status: "failed",
-          error: error instanceof Error ? error : new Error(String(error)),
-        };
-        logger.warn(
-          `Failed to enqueue staging trace record (secondary) for project ${projectId} trace ${entityId}`,
-          error,
-        );
-        traceException(error);
-      }
+    if (createEventTraceRecord) {
+      const traceAsStagingObservation = convertTraceToStagingObservation(
+        finalTraceRecord,
+        this.getPartitionAwareTimestamp(createdAtTimestamp),
+      );
+      this.clickHouseWriter.addToQueue(
+        TableName.ObservationsBatchStaging,
+        traceAsStagingObservation,
+      );
     }
 
-    // SECONDARY: Add trace into trace upsert queue for eval processing
+    // Add trace into trace upsert queue for eval processing
     // First check if we already know this project has no job configurations
     const hasNoJobConfigs = await hasNoEvalConfigsCache(
       projectId,
       "traceBased",
-    ).catch(() => {
-      // If cache check fails, proceed conservatively (assume configs may exist)
-      return false;
-    });
+    );
     if (hasNoJobConfigs) {
       logger.debug(
         `Skipping TraceUpsert queue for project ${projectId} - no job configs cached`,
       );
+      return;
     } else {
       // Job configs present, so we add to the TraceUpsert queue.
       const shardingKey = `${projectId}-${entityId}`;
       const traceUpsertQueue = TraceUpsertQueue.getInstance({ shardingKey });
       if (!traceUpsertQueue) {
         logger.error("TraceUpsertQueue is not initialized");
-        result.secondary.traceUpsertQueue = {
-          status: "failed",
-          error: new Error("TraceUpsertQueue not initialized"),
-        };
-      } else if (result.critical.mainTableWrite.status === "success") {
-        try {
-          await traceUpsertQueue.add(QueueJobs.TraceUpsert, {
-            payload: {
-              projectId,
-              traceId: entityId,
-              exactTimestamp: new Date(finalTraceRecord.timestamp),
-              traceEnvironment: finalTraceRecord.environment,
-            },
-            id: randomUUID(),
-            timestamp: new Date(),
-            name: QueueJobs.TraceUpsert as const,
-          });
-          result.secondary.traceUpsertQueue = { status: "success" };
-        } catch (error) {
-          result.secondary.traceUpsertQueue = {
-            status: "failed",
-            error: error instanceof Error ? error : new Error(String(error)),
-          };
-          logger.warn(
-            `Failed to enqueue TraceUpsert (secondary) for project ${projectId} trace ${entityId}`,
-            error,
-          );
-          traceException(error);
-        }
+        return;
       }
+      await traceUpsertQueue.add(QueueJobs.TraceUpsert, {
+        payload: {
+          projectId,
+          traceId: entityId,
+          exactTimestamp: new Date(finalTraceRecord.timestamp),
+          traceEnvironment: finalTraceRecord.environment,
+        },
+        id: randomUUID(),
+        timestamp: new Date(),
+        name: QueueJobs.TraceUpsert as const,
+      });
     }
-
-    return result;
   }
 
   private async processObservationEventList(params: {
@@ -995,24 +751,16 @@ export class IngestionService {
     entityId: string;
     createdAtTimestamp: Date;
     observationEventList: ObservationEvent[];
-    writeToStagingTables?: boolean;
-    baseResult?: MergeAndWriteResult;
-  }): Promise<MergeAndWriteResult> {
+    writeToStagingTables: boolean;
+  }) {
     const {
       projectId,
       entityId,
       createdAtTimestamp,
       observationEventList,
-      writeToStagingTables = false,
+      writeToStagingTables,
     } = params;
-    const baseResult: MergeAndWriteResult = params.baseResult ?? {
-      success: false,
-      eventCount: observationEventList.length,
-      critical: { ...EMPTY_CRITICAL },
-      secondary: { ...EMPTY_SECONDARY },
-    };
-    const result = { ...baseResult };
-    if (observationEventList.length === 0) return result;
+    if (observationEventList.length === 0) return;
 
     const timeSortedEvents =
       IngestionService.toTimeSortedEventList(observationEventList);
@@ -1113,7 +861,6 @@ export class IngestionService {
       ...generationUsage,
     };
 
-    // SECONDARY (but creates trace_id dependency for main write):
     // Backward compat: create wrapper trace for SDK < 2.0.0 events that do not have a traceId
     if (!finalObservationRecord.trace_id) {
       const wrapperTraceRecord: TraceRecordInsertType = {
@@ -1131,75 +878,33 @@ export class IngestionService {
         is_deleted: 0,
       };
 
-      try {
-        this.clickHouseWriter.addToQueue(TableName.Traces, wrapperTraceRecord);
-        finalObservationRecord.trace_id = finalObservationRecord.id;
-        result.secondary.wrapperTraceWrite = { status: "success" };
-      } catch (error) {
-        result.secondary.wrapperTraceWrite = {
-          status: "failed",
-          error: error instanceof Error ? error : new Error(String(error)),
-        };
-        logger.error(
-          `Failed to enqueue wrapper trace for observation ${entityId} project ${projectId}`,
-          error,
-        );
-        traceException(error);
-        // wrapper trace failure blocks the main observation write, as it would fail FK-style consistency
-        result.critical.mainTableWrite = {
-          status: "failed",
-          error: new Error("Wrapper trace enqueue failed"),
-        };
-        return result;
-      }
+      this.clickHouseWriter.addToQueue(TableName.Traces, wrapperTraceRecord);
+      finalObservationRecord.trace_id = finalObservationRecord.id;
     }
 
-    // CRITICAL: Main Observations table write
-    try {
-      this.clickHouseWriter.addToQueue(
-        TableName.Observations,
-        finalObservationRecord,
-      );
-      result.critical.mainTableWrite = { status: "success" };
-    } catch (error) {
-      result.critical.mainTableWrite = {
-        status: "failed",
-        error: error instanceof Error ? error : new Error(String(error)),
+    this.clickHouseWriter.addToQueue(
+      TableName.Observations,
+      finalObservationRecord,
+    );
+
+    // Dual-write to staging table for batch propagation to events table
+    // Here, we add some additional logic around the first seen timestamp.
+    // We "lock" partitions 4min after their creation, i.e. the 15:00:00 partition
+    // should stop receiving updates at 15:04:00.
+    // This means that we keep the createdAtTimestamp as-is if it is within the last
+    // 3.5 minutes (incl. a 30s buffer around writes) and otherwise,
+    // we set the current timestamp for the event.
+    if (writeToStagingTables) {
+      const stagingRecord = {
+        ...finalObservationRecord,
+        s3_first_seen_timestamp:
+          this.getPartitionAwareTimestamp(createdAtTimestamp),
       };
-      logger.error(
-        `Failed to enqueue observation record for project ${projectId} observation ${entityId}`,
-        error,
+      this.clickHouseWriter.addToQueue(
+        TableName.ObservationsBatchStaging,
+        stagingRecord,
       );
-      traceException(error);
     }
-
-    // SECONDARY: Dual-write to staging table for batch propagation to events table
-    if (writeToStagingTables && result.critical.mainTableWrite.status === "success") {
-      try {
-        const stagingRecord = {
-          ...finalObservationRecord,
-          s3_first_seen_timestamp:
-            this.getPartitionAwareTimestamp(createdAtTimestamp),
-        };
-        this.clickHouseWriter.addToQueue(
-          TableName.ObservationsBatchStaging,
-          stagingRecord,
-        );
-        result.secondary.stagingTableWrite = { status: "success" };
-      } catch (error) {
-        result.secondary.stagingTableWrite = {
-          status: "failed",
-          error: error instanceof Error ? error : new Error(String(error)),
-        };
-        logger.warn(
-          `Failed to enqueue staging observation (secondary) for project ${projectId} observation ${entityId}`,
-          error,
-        );
-        traceException(error);
-      }
-    }
-
-    return result;
   }
 
   private async mergeScoreRecords(params: {

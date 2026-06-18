@@ -432,71 +432,29 @@ export const otelIngestionQueueProcessorBuilder = (
         // the highest possible throughput. Therefore, we start with a Promise.all.
         // If necessary, we may use a for each instead.
 
-        // Process observations via mergeAndWrite.
-        // Use allSettled so a single failing observation does not abort the entire batch.
-        const observationResults = await Promise.allSettled(
-          observations.map(async (observation) => {
-            const result = await ingestionService.mergeAndWrite(
+        // Process observations via mergeAndWrite
+        const observationWritePromise = Promise.all(
+          observations.map((observation) =>
+            ingestionService.mergeAndWrite(
               getClickhouseEntityType(observation.type),
               auth.scope.projectId,
               observation.body.id || "", // id is always defined for observations
               new Date(), // Use the current timestamp as event time
               [observation],
               shouldForwardToEventsTable,
-            );
-            if (!result.success) {
-              throw result.error ?? new Error("Unknown mergeAndWrite failure");
-            }
-            return observation;
-          }),
+            ),
+          ),
         );
 
-        // Collect failed observations and re-route them through the normal ingestion pipeline
-        // so they can be retried with the standard S3 + IngestionQueue + BullMQ mechanism.
-        const failedObservations: typeof observations = [];
-        observationResults.forEach((result, index) => {
-          if (result.status === "rejected") {
-            const observation = observations[index];
-            failedObservations.push(observation);
-            logger.error(
-              `OTEL observation mergeAndWrite failed, re-routing to ingestion queue for project ${auth.scope.projectId} and observation ${observation.body.id || observation.id}`,
-              { error: result.reason, fileKey },
-            );
-          }
-        });
-
-        // Process traces and failed observation re-routing concurrently.
-        // Failed observations go through processEventBatch which uses S3 + IngestionQueue
-        // with proper retry semantics and seen-cache handling.
-        const [traceResults, failedObsRequeueResult] = await Promise.allSettled([
+        // Process traces and observations concurrently
+        await Promise.all([
+          observationWritePromise,
           processEventBatch(traces, auth, {
             delay: 0,
             source: "otel",
             forwardToEventsTable: shouldForwardToEventsTable,
           }),
-          failedObservations.length > 0
-            ? processEventBatch(failedObservations, auth, {
-                delay: 0,
-                source: "otel",
-                forwardToEventsTable: shouldForwardToEventsTable,
-              })
-            : Promise.resolve({ successes: [], errors: [] }),
         ]);
-
-        if (traceResults.status === "rejected") {
-          logger.error(
-            `Failed to process otel traces for project ${auth.scope.projectId}`,
-            { error: traceResults.reason, fileKey },
-          );
-          traceException(traceResults.reason);
-        }
-        if (failedObsRequeueResult.status === "rejected") {
-          logger.error(
-            `Failed to re-queue failed otel observations for project ${auth.scope.projectId}`,
-            { error: failedObsRequeueResult.reason, fileKey, count: failedObservations.length },
-          );
-          traceException(failedObsRequeueResult.reason);
-        }
       }
 
       // Process events for observation evals and direct event writes

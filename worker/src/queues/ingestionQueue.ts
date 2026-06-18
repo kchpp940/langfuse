@@ -9,7 +9,6 @@ import {
   isS3SlowDownError,
   logger,
   markProjectS3Slowdown,
-  processEventBatch,
   QueueName,
   recordDistribution,
   recordHistogram,
@@ -22,10 +21,7 @@ import {
 import { prisma } from "@langfuse/shared/src/db";
 
 import { env, v4WritesToEventsTable } from "../env";
-import {
-  IngestionService,
-  type S3ProcessedFile,
-} from "../services/IngestionService";
+import { IngestionService } from "../services/IngestionService";
 import { ClickhouseWriter, TableName } from "../services/ClickhouseWriter";
 import { chunk } from "lodash";
 import { randomUUID } from "crypto";
@@ -157,8 +153,6 @@ export const ingestionQueueProcessorBuilder = (
 
       let eventFiles: { file: string; createdAt: Date }[] = [];
       const events: IngestionEventType[] = [];
-      // Track each S3 file with its event ids and processing status for fine-grained seen-cache control
-      const s3Files: S3ProcessedFile[] = [];
 
       // Check if we should skip S3 list operation
       const shouldSkipS3List =
@@ -172,7 +166,6 @@ export const ingestionQueueProcessorBuilder = (
         // Direct file download - skip S3 list operation
         const filePath = `${s3Prefix}${job.data.payload.data.fileKey}.json`;
         eventFiles = [{ file: filePath, createdAt: new Date() }];
-        const s3FileKey = `${job.data.payload.data.fileKey}.json`;
 
         try {
           const file = await s3Client.download(filePath);
@@ -184,25 +177,16 @@ export const ingestionQueueProcessorBuilder = (
           totalS3DownloadSizeBytes += fileSize;
 
           const parsedFile = JSON.parse(file);
-          const fileEvents = Array.isArray(parsedFile) ? parsedFile : [parsedFile];
-          events.push(...fileEvents);
-          s3Files.push({
-            s3FileKey,
-            eventIds: fileEvents.map((e: IngestionEventType) => e.id),
-            processed: true,
-          });
+          events.push(...(Array.isArray(parsedFile) ? parsedFile : [parsedFile]));
         } catch (e) {
           logger.error(
-            `Failed to download or parse S3 file ${filePath} for project ${job.data.payload.authCheck.scope.projectId} and event ${job.data.payload.data.eventBodyId}`,
+            `Failed to download or parse S3 file ${filePath} for project ${job.data.payload.authCheck.scope.projectId}`,
             e,
           );
-          // Remove the failed file from eventFiles so it is not cached as "seen" below
-          eventFiles = eventFiles.filter((f) => f.file !== filePath);
-          s3Files.push({
-            s3FileKey,
-            eventIds: [],
-            processed: false,
+          recordIncrement("langfuse.ingestion.s3_file_download_failure", 1, {
+            skippedS3List: "true",
           });
+          eventFiles = eventFiles.filter((f) => f.file !== filePath);
         }
       } else {
         eventFiles = await s3Client.listFiles(s3Prefix);
@@ -210,7 +194,6 @@ export const ingestionQueueProcessorBuilder = (
         // Process files in batches
         // If a user has 5k events, this will likely take 100 seconds.
         const downloadAndParseFile = async (fileRef: { file: string }) => {
-          const s3FileKey = fileRef.file.split("/").pop() ?? fileRef.file;
           try {
             const file = await s3Client.download(fileRef.file);
             const fileSize = file.length;
@@ -221,26 +204,20 @@ export const ingestionQueueProcessorBuilder = (
             totalS3DownloadSizeBytes += fileSize;
 
             const parsedFile = JSON.parse(file);
-            const fileEvents = Array.isArray(parsedFile) ? parsedFile : [parsedFile];
             return {
               file: fileRef.file,
-              events: fileEvents,
-              success: true as const,
-              s3FileKey,
-              eventIds: fileEvents.map((e: IngestionEventType) => e.id),
+              events: Array.isArray(parsedFile) ? parsedFile : [parsedFile],
+              success: true,
             };
           } catch (e) {
             logger.error(
-              `Failed to download or parse S3 file ${fileRef.file} for project ${job.data.payload.authCheck.scope.projectId} and event ${job.data.payload.data.eventBodyId}`,
+              `Failed to download or parse S3 file ${fileRef.file} for project ${job.data.payload.authCheck.scope.projectId}`,
               e,
             );
-            return {
-              file: fileRef.file,
-              events: [],
-              success: false as const,
-              s3FileKey,
-              eventIds: [],
-            };
+            recordIncrement("langfuse.ingestion.s3_file_download_failure", 1, {
+              skippedS3List: "false",
+            });
+            return { file: fileRef.file, events: [], success: false };
           }
         };
 
@@ -252,19 +229,12 @@ export const ingestionQueueProcessorBuilder = (
             batch.map(downloadAndParseFile),
           );
           for (const result of batchResults) {
-            events.push(...result.events);
-            s3Files.push({
-              s3FileKey: result.s3FileKey,
-              eventIds: result.eventIds,
-              processed: result.success,
-            });
             if (result.success) {
+              events.push(...result.events);
               successfullyProcessedFiles.push(result.file);
             }
           }
         }
-        // Only keep files in eventFiles that were successfully processed,
-        // so failed files are not cached as "seen" below and may be retried.
         eventFiles = eventFiles.filter((f) =>
           successfullyProcessedFiles.includes(f.file),
         );
@@ -300,6 +270,31 @@ export const ingestionQueueProcessorBuilder = (
         return;
       }
 
+      // Set "seen" keys in Redis to avoid reprocessing for fast updates.
+      // We use Promise.all internally instead of a redis.pipeline since autoPipelining should handle it correctly
+      // while being redis cluster aware.
+      if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
+        try {
+          await Promise.all(
+            eventFiles
+              .map((e) => e.file.split("/").pop() ?? "")
+              .map((key) =>
+                redis!.set(
+                  `langfuse:ingestion:recently-processed:${job.data.payload.authCheck.scope.projectId}:${job.data.payload.data.type}:${job.data.payload.data.eventBodyId}:${key.replace(".json", "")}`,
+                  "1",
+                  "EX",
+                  60 * 5, // 5 minutes
+                ),
+              ),
+          );
+        } catch (e) {
+          logger.warn(
+            `Failed to set recently-processed cache. Continuing processing.`,
+            e,
+          );
+        }
+      }
+
       // Perform merge of those events
       if (!redis) throw new Error("Redis not available");
       if (!prisma) throw new Error("Prisma not available");
@@ -310,7 +305,7 @@ export const ingestionQueueProcessorBuilder = (
         job.data.payload.data.forwardToEventsTable ??
         v4WritesToEventsTable(env);
 
-      const mergeResult = await new IngestionService(
+      await new IngestionService(
         redis,
         prisma,
         clickhouseWriter,
@@ -322,128 +317,7 @@ export const ingestionQueueProcessorBuilder = (
         firstS3WriteTime,
         events,
         forwardToEventsTable,
-        s3Files,
       );
-
-      // Determine whether we should retry based on critical vs secondary failures.
-      // Retry only when critical operations failed (main table write, session upsert, dataset item lookup).
-      // Secondary failures (staging table write, eval queue, wrapper trace, score validation)
-      // are logged but do not trigger a retry since the core data was persisted safely.
-      const criticalOpsFailed =
-        mergeResult.critical.mainTableWrite.status === "failed" ||
-        mergeResult.critical.sessionUpsert.status === "failed" ||
-        mergeResult.critical.datasetItemLookup.status === "failed";
-
-      // Check if any secondary operations failed (for logging / observability).
-      const secondaryOpsFailed =
-        mergeResult.secondary.stagingTableWrite.status === "failed" ||
-        mergeResult.secondary.traceUpsertQueue.status === "failed" ||
-        mergeResult.secondary.wrapperTraceWrite.status === "failed" ||
-        mergeResult.secondary.scoreValidation.status === "failed";
-
-      if (criticalOpsFailed) {
-        // Critical data loss scenario: core record was not written.
-        // Do NOT set "seen" cache, so that S3 files remain eligible for reprocessing.
-        // Instead of throwing (which triggers BullMQ retry with exponential backoff),
-        // re-route the failed events through processEventBatch for a clean retry
-        // via the standard S3 + IngestionQueue path. This preserves full retry
-        // semantics, monitoring, and avoids data loss due to seen-cache misordering.
-        const firstCriticalError =
-          mergeResult.critical.mainTableWrite.error ??
-          mergeResult.critical.sessionUpsert.error ??
-          mergeResult.critical.datasetItemLookup.error ??
-          mergeResult.error ??
-          new Error("Unknown critical mergeAndWrite failure");
-        logger.error(
-          `Critical mergeAndWrite failure for project ${job.data.payload.authCheck.scope.projectId} eventBody ${job.data.payload.data.eventBodyId} - re-routing via processEventBatch for retry`,
-          {
-            eventType: job.data.payload.data.type,
-            eventCount: mergeResult.eventCount,
-            critical: mergeResult.critical,
-            secondary: secondaryOpsFailed ? mergeResult.secondary : undefined,
-            error: firstCriticalError,
-          },
-        );
-
-        // Re-queue the raw events through the standard ingestion pipeline.
-        // This will re-upload to S3 (new file, not conflicting with existing)
-        // and create a new IngestionQueue job with full retry semantics.
-        // The original S3 files remain unmarked as "seen" and will be re-listed
-        // when the new job runs, so events are merged correctly.
-        if (mergeResult.rawEvents.length > 0) {
-          try {
-            const authCheck = job.data.payload.authCheck as {
-              validKey: true;
-              scope: {
-                projectId: string;
-                accessLevel: "project" | "scores";
-              };
-            };
-            await processEventBatch(mergeResult.rawEvents, authCheck, {
-              delay: 5000, // small delay to let transient issues resolve
-              source: "ingestion-retry",
-            });
-            recordIncrement(
-              "langfuse.ingestion.merge_and_write.retry_rerouted",
-              mergeResult.eventCount,
-              {
-                projectId: job.data.payload.authCheck.scope.projectId,
-                eventType: job.data.payload.data.type,
-              },
-            );
-          } catch (requeueError) {
-            logger.error(
-              `Failed to re-queue failed events for project ${job.data.payload.authCheck.scope.projectId} eventBody ${job.data.payload.data.eventBodyId}`,
-              requeueError,
-            );
-            traceException(requeueError);
-            // If re-queue also fails, fall back to throwing so BullMQ retries the original job
-            throw firstCriticalError;
-          }
-        }
-
-        // Do not throw - the original job is ack'd successfully.
-        // The retry is handled by the new processEventBatch flow above.
-        return;
-      }
-
-      // Core data is safely persisted. Mark only fully processed S3 files as seen.
-      // Secondary ops are best-effort and do not justify reprocessing the entire eventBody.
-      const processedFiles = mergeResult.s3Files.filter((f) => f.processed);
-
-      if (secondaryOpsFailed) {
-        logger.warn(
-          `mergeAndWrite succeeded with secondary failures for project ${job.data.payload.authCheck.scope.projectId} eventBody ${job.data.payload.data.eventBodyId} - marking ${processedFiles.length}/${mergeResult.s3Files.length} files as seen anyway`,
-          {
-            eventType: job.data.payload.data.type,
-            secondary: mergeResult.secondary,
-          },
-        );
-      }
-
-      // Set "seen" keys in Redis only for successfully processed files, after successful critical-path merge.
-      // We use Promise.all internally instead of a redis.pipeline since autoPipelining should handle it correctly
-      // while being redis cluster aware.
-      // IMPORTANT: This must happen AFTER successful critical merge so that failed events can be retried.
-      if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
-        try {
-          await Promise.all(
-            processedFiles.map((s3File) =>
-              redis!.set(
-                `langfuse:ingestion:recently-processed:${job.data.payload.authCheck.scope.projectId}:${job.data.payload.data.type}:${job.data.payload.data.eventBodyId}:${s3File.s3FileKey.replace(".json", "")}`,
-                "1",
-                "EX",
-                60 * 5, // 5 minutes
-              ),
-            ),
-          );
-        } catch (e) {
-          logger.warn(
-            `Failed to set recently-processed cache after successful merge. Events may be reprocessed (idempotent, so safe).`,
-            e,
-          );
-        }
-      }
     } catch (e) {
       // Check if this is a SlowDown error and mark the project for secondary queue
       if (isS3SlowDownError(e)) {
